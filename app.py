@@ -368,6 +368,9 @@ def inject_cockpit_css() -> None:
             gap: 6px;
             margin-bottom: 10px;
         }
+        .mini-kpi-grid.cols-4 {
+            grid-template-columns: repeat(4, 1fr);
+        }
         .mini-kpi {
             background: #0B0F19;
             border: 1px solid var(--border-hairline);
@@ -970,6 +973,19 @@ def apply_filters(cell_df: pd.DataFrame) -> pd.DataFrame:
         df = df[(df["IRAT_Denom"] >= 10) & (df["IRAT_PingPong_Rate"] > 5.0)]
     elif preset == "Radio Quality / CQI Degraded":
         df = df[(df["CQI_Samples"] >= 100) & ((df["Avg_CQI"] < 7.5) | (df["Low_CQI_Ratio"] > 30.0) | (df["UL_Intf_dBm"] > -110.0))]
+    elif preset == "VoLTE Degradation (QCI=1)":
+        has_q5 = bool(df["Has_QCI5"].any()) if "Has_QCI5" in df.columns else False
+        v_cssr_mask = (
+            (df["VoLTE_CSSR"] < 97.5) | (df["VoLTE_Bearer_SR"] < 98.0)
+            if has_q5
+            else (df["VoLTE_Bearer_SR"] < 98.0) | ((df["VoLTE_CSSR"] < 97.5) & (df["VoLTE_Bearer_SR"] < 99.5))
+        )
+        v_sess_col = df["pmSessionTimeDrbQci[1]"] if "pmSessionTimeDrbQci[1]" in df.columns else 0.0
+        v_dcr_mask = (df["VoLTE_DCR"] > 0.8) | ((v_sess_col >= 1800.0) & (df["VoLTE_DCR_Norm"] > 3.0))
+        df = df[
+            ((df["VoLTE_CSSR_Denom"] >= 10) & v_cssr_mask)
+            | ((df["VoLTE_DCR_Denom"] >= 10) & v_dcr_mask)
+        ]
 
     if st.session_state["sel_enodebs"]:
         df = df[df["eNodeB_Name"].isin(st.session_state["sel_enodebs"])]
@@ -1020,7 +1036,7 @@ def main() -> None:
         uploaded_file = st.file_uploader(
             "Drag & Drop ENM / AMOS Dump (.xlsx, .xls, .csv)",
             type=["xlsx", "xls", "csv"],
-            help="Supports multi-sheet ENIQ/ENM dumps (CSSR_DCR, CqiDistr, InterferencePwrPrb) and metadata header rows.",
+            help="Supports multi-sheet ENIQ/ENM dumps (Data / CSSR_DCR, CqiDistr, InterferencePwrPrb, VoLTE) and metadata header rows.",
         )
 
         # Load uploaded file or auto-ingest default Data/Counters.xlsx
@@ -1045,10 +1061,15 @@ def main() -> None:
 
         st.markdown("---")
         st.markdown("##### ⚡ Quick Triage Presets")
+        active_presets = list(TRIAGE_PRESETS)
+        if result.has_volte_counters:
+            active_presets.insert(-1, "VoLTE Degradation (QCI=1)")
+        if st.session_state["triage_preset"] not in active_presets:
+            st.session_state["triage_preset"] = "All Degraded"
         selected_preset = st.radio(
             "Diagnostic Preset",
-            options=TRIAGE_PRESETS,
-            index=TRIAGE_PRESETS.index(st.session_state["triage_preset"]),
+            options=active_presets,
+            index=active_presets.index(st.session_state["triage_preset"]),
             key=f"radio_preset_{gen_key}",
             label_visibility="collapsed",
         )
@@ -1172,6 +1193,9 @@ def main() -> None:
                 width="stretch",
             )
 
+    for warn_msg in getattr(result, "data_warnings", []):
+        st.warning(f"⚠️ **Cảnh báo Toàn vẹn Dữ liệu ENIQ/BO:** {warn_msg}")
+
     # ------------------------------------------------------------------
     # TIER 1: EXECUTIVE METRIC BAR (4 COMPACT NOC CARDS)
     # ------------------------------------------------------------------
@@ -1205,6 +1229,19 @@ def main() -> None:
         else float(full_df["DCR_eNB"].mean())
     )
     avg_dcr_norm = float(full_df["DCR_Norm"].mean())
+
+    valid_vcssr_cells = full_df[full_df["VoLTE_CSSR_Denom"] >= 10]
+    avg_volte_cssr = (
+        float(valid_vcssr_cells["VoLTE_CSSR"].mean())
+        if not valid_vcssr_cells.empty
+        else float(full_df["VoLTE_CSSR"].mean())
+    )
+    valid_vdcr_cells = full_df[full_df["VoLTE_DCR_Denom"] >= 10]
+    avg_volte_dcr = (
+        float(valid_vdcr_cells["VoLTE_DCR"].mean())
+        if not valid_vdcr_cells.empty
+        else float(full_df["VoLTE_DCR"].mean())
+    )
 
     c1, c2, c3, c4 = st.columns(4, gap="small")
 
@@ -1251,6 +1288,11 @@ def main() -> None:
     with c3:
         cssr_card_cls = "card-norm" if avg_cssr >= 98.5 else ("card-deg" if avg_cssr >= 97.0 else "card-crit")
         delta_badge_cls = "badge-normal" if cssr_delta >= 0 else ("badge-degraded" if avg_cssr >= 97.0 else "badge-critical")
+        c3_foot_left = (
+            f'<span class="mono-num" style="color:#38BDF8;">VoLTE SR: {avg_volte_cssr:.2f}%</span>'
+            if result.has_volte_counters
+            else "<span>RRC &times; S1-C &times; Init E-RAB</span>"
+        )
         render_html(
             f"""
             <div class="kpi-card {cssr_card_cls}">
@@ -1260,7 +1302,7 @@ def main() -> None:
                 <span class="status-badge {delta_badge_cls}">{cssr_delta:+.2f}% vs 98.5%</span>
               </div>
               <div class="kpi-foot">
-                <span>RRC &times; S1-C &times; Init E-RAB</span>
+                {c3_foot_left}
                 <span class="mono-num">HOSR: {full_df['HOSR'].mean():.2f}%</span>
               </div>
             </div>
@@ -1275,6 +1317,11 @@ def main() -> None:
             if dcr_breach
             else '<span class="status-badge badge-normal">✓ &le; 1.0% OK</span>'
         )
+        c4_foot_right = (
+            f'<span class="mono-num" style="color:{"#FAAD14" if avg_volte_dcr > 0.8 else "#38BDF8"};">VoLTE DCR: {avg_volte_dcr:.2f}%</span>'
+            if result.has_volte_counters
+            else f'<span class="mono-num">{avg_dcr_norm:.1f} drops/hr</span>'
+        )
         render_html(
             f"""
             <div class="kpi-card {dcr_card_cls}">
@@ -1285,7 +1332,7 @@ def main() -> None:
               </div>
               <div class="kpi-foot">
                 <span class="mono-num">eNB DCR: {avg_dcr_enb:.2f}%</span>
-                <span class="mono-num">{avg_dcr_norm:.1f} drops/hr</span>
+                {c4_foot_right}
               </div>
             </div>
             """
@@ -1624,6 +1671,24 @@ def main() -> None:
             amos_text = str(cell_row["AMOS_Script"])
             amos_lines_html = format_amos_terminal_html(amos_text)
 
+            mini_grid_cls = "mini-kpi-grid cols-4" if result.has_volte_counters else "mini-kpi-grid"
+            volte_mini_html = ""
+            if result.has_volte_counters:
+                vc_val = float(cell_row["VoLTE_CSSR"])
+                vd_val = float(cell_row["VoLTE_DCR"])
+                vc_col = "#FF4D4F" if vc_val < 95.0 else ("#FAAD14" if vc_val < 97.5 else "#52C41A")
+                vd_col = "#FF4D4F" if vd_val > 2.0 else ("#FAAD14" if vd_val > 0.8 else "#52C41A")
+                volte_mini_html = f"""
+                    <div class="mini-kpi">
+                      <div class="mk-lbl">VoLTE CSSR</div>
+                      <div class="mk-val" style="color:{vc_col};">{vc_val:.2f}%</div>
+                    </div>
+                    <div class="mini-kpi">
+                      <div class="mk-lbl">VoLTE DCR</div>
+                      <div class="mk-val" style="color:{vd_col};">{vd_val:.2f}%</div>
+                    </div>
+                """
+
             render_html(
                 f"""
                 <div class="inspector-drawer drawer-{html.escape(st_val)}">
@@ -1639,7 +1704,7 @@ def main() -> None:
                       </div>
                     </div>
                   </div>
-                  <div class="mini-kpi-grid">
+                  <div class="{mini_grid_cls}">
                     <div class="mini-kpi">
                       <div class="mk-lbl">CSSR</div>
                       <div class="mk-val" style="color:{'#FF4D4F' if cell_row['CSSR']<97 else '#52C41A'};">{cell_row['CSSR']:.2f}%</div>
@@ -1664,6 +1729,7 @@ def main() -> None:
                       <div class="mk-lbl">UL Noise</div>
                       <div class="mk-val" style="color:{'#FF4D4F' if pd.notna(cell_row['UL_Intf_dBm']) and cell_row['UL_Intf_dBm']>-110 else '#38BDF8'};">{intf_str} dBm</div>
                     </div>
+                    {volte_mini_html}
                   </div>
                   <div class="rca-callout">
                     <div style="color:#F8FAFC;font-weight:600;">🎯 {html.escape(str(cell_row['Primary_Root_Cause']))}</div>

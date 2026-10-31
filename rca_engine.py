@@ -260,6 +260,7 @@ class AnalysisResult:
     has_volte_counters: bool = False
     has_prb_spectrum: bool = False
     has_3gpp_dcr_denom: bool = True
+    data_warnings: List[str] = field(default_factory=list)
 
 
 # ============================================================================
@@ -420,6 +421,51 @@ def _classify_sheet(df: pd.DataFrame) -> str:
     if any(c.startswith("pm") or c.startswith("UtranCellRelation.") for c in cols):
         return "kpi_main"
     return "unknown"
+
+
+def _normalize_and_validate_bare_qci(
+    df: pd.DataFrame, sheet_label: str, warnings_out: List[str]
+) -> pd.DataFrame:
+    """
+    When a sheet without `Vector_Index` contains bare `*Qci` columns (e.g., BO Query filtered on
+    DCVECTOR_INDEX=1), validate that values are not an unmerged BusinessObjects Grand Total
+    constant repeated identically across all cells/ROPs before mapping them to `[1]`.
+    """
+    if "Vector_Index" in df.columns or df.empty:
+        return df
+
+    bare_qci_map: Dict[str, str] = {}
+    for col in df.columns:
+        c_low = str(col).strip().lower()
+        if c_low.startswith("pm") and c_low.endswith("qci") and f"{c_low}[1]" in COUNTER_LOWER_MAP:
+            bare_qci_map[col] = COUNTER_LOWER_MAP[f"{c_low}[1]"]
+
+    if not bare_qci_map:
+        return df
+
+    n_cells = df["EUtranCellFDD"].nunique() if "EUtranCellFDD" in df.columns else 1
+    if n_cells >= 5 and len(df) >= 20:
+        nonzero_bare = []
+        all_constant = True
+        for col in bare_qci_map:
+            s_num = pd.to_numeric(df[col], errors="coerce")
+            if s_num.notna().any() and float(s_num.fillna(0).abs().sum()) > 0:
+                nonzero_bare.append(col)
+                if s_num.dropna().nunique() > 1:
+                    all_constant = False
+                    break
+        if nonzero_bare and all_constant:
+            sample_col = nonzero_bare[0]
+            sample_val = pd.to_numeric(df[sample_col], errors="coerce").dropna().iloc[0]
+            warnings_out.append(
+                f"Sheet '{sheet_label}': Phát hiện {len(bare_qci_map)} cột VoLTE QCI (vd: {sample_col}={int(sample_val):,}) "
+                f"bị lặp cùng 1 con số tổng (Grand Total) giống hệt nhau trên toàn bộ {len(df):,} dòng ({n_cells} cells) "
+                f"do chưa Merge Dimensions / chưa tách Vector Index=1 trong BusinessObjects. "
+                f"Hệ thống đã tạm cách ly các cột hằng số này để tránh báo sai VoLTE KPI đồng loạt."
+            )
+            return df.drop(columns=list(bare_qci_map.keys()))
+
+    return df.rename(columns=bare_qci_map)
 
 
 def _pivot_qci_long_sheet(df_qci: pd.DataFrame) -> pd.DataFrame:
@@ -659,7 +705,7 @@ def _process_prb_spectrum_sheet(
 # ============================================================================
 
 def _diagnose_cell_row(
-    row: pd.Series, has_irat: bool, has_volte: bool
+    row: pd.Series, has_irat: bool, has_volte: bool, has_qci5: bool = False
 ) -> Dict[str, Any]:
     """
     Execute Step 0 Statistical Sample Gate (Section 2.8) + Sequential Decision
@@ -1173,8 +1219,13 @@ def _diagnose_cell_row(
     # ------------------------------------------------------------------
     # TREE 4.6: VoLTE BAD CSSR (v6.0.0)
     # ------------------------------------------------------------------
-    if valid_vcssr and (volte_cssr < 97.5 or volte_bearer_sr < 98.0):
-        sev = 3 if volte_cssr < 95.0 else 2
+    vcssr_bad = (
+        (volte_cssr < 97.5 or volte_bearer_sr < 98.0)
+        if has_qci5
+        else (volte_bearer_sr < 98.0 or (volte_cssr < 97.5 and volte_bearer_sr < 99.5))
+    )
+    if valid_vcssr and vcssr_bad:
+        sev = 3 if (volte_cssr < 95.0 or volte_bearer_sr < 95.0) else 2
         gbr_dl = float(row.get("pmErabEstabFailGbrDlEnb", 0.0))
         gbr_ul = float(row.get("pmErabEstabFailGbrUlEnb", 0.0))
         erab_lic = float(row.get("pmErabEstabFailInitLic", 0.0))
@@ -1187,12 +1238,12 @@ def _diagnose_cell_row(
             v_cause = "Missing Feature License for VoLTE / GBR Bearers"
             v_cat = "License Congestion"
             v_rec = "Verify license key installation for VoLTE (FAJ 121 0858) and GBR Bearer support."
-        elif volte_qci5_cssr < 98.0:
+        elif has_qci5 and volte_qci5_cssr < 98.0:
             v_cause = "SIP IMS Signaling Bearer (QCI=5) Setup Failure"
             v_cat = "VoLTE QCI=1 Bearer / IMS"
             v_rec = "Inspect S1-U GTP-U bearer connectivity to P-CSCF; check QCI=5 DSCP mapping (EF/AF41)."
         else:
-            v_cause = f"PUCCH SR / CQI Periodicity Resource Congestion for QCI=1 (VoLTE CSSR {volte_cssr:.2f}%)"
+            v_cause = f"PUCCH SR / CQI Periodicity Resource Congestion for QCI=1 (QCI1 SR {volte_bearer_sr:.2f}%, VoLTE CSSR {volte_cssr:.2f}%)"
             v_cat = "VoLTE QCI=1 Bearer / IMS"
             v_rec = "Increase noOfPucchCqiUsers and optimize commonCqiPeriodicity to 40 ms."
 
@@ -1209,11 +1260,13 @@ def _diagnose_cell_row(
     # ------------------------------------------------------------------
     # TREE 4.7: VoLTE HIGH DCR (v6.0.0)
     # ------------------------------------------------------------------
-    if valid_vdcr and (volte_dcr > 0.8 or volte_dcr_norm > 3.0):
-        sev = 3 if volte_dcr > 2.0 else 2
+    v_sess_time = float(row.get("pmSessionTimeDrbQci[1]", 0.0))
+    vdcr_norm_bad = v_sess_time >= 1800.0 and volte_dcr_norm > 3.0
+    if valid_vdcr and (volte_dcr > 0.8 or vdcr_norm_bad):
         v_abn_enb = float(row.get("pmErabRelAbnormalEnbActQci[1]", 0.0))
         v_abn_mme = float(row.get("pmErabRelAbnormalMmeActQci[1]", 0.0))
         v_tot_abn = v_abn_enb + v_abn_mme
+        sev = 3 if (volte_dcr > 2.0 and v_tot_abn >= 2) else 2
         v_ue_lost = float(row.get("pmErabRelAbnormalEnbActUeLostQci[1]", 0.0))
         v_ho = float(row.get("pmErabRelAbnormalEnbActHoQci[1]", 0.0))
         v_pe = float(row.get("pmErabRelAbnormalEnbActPeQci[1]", 0.0))
@@ -1375,11 +1428,14 @@ def _diagnose_cell_row(
         )
 
     if has_volte:
+        v_abn_e = int(row.get("pmErabRelAbnormalEnbActQci[1]", 0))
+        v_abn_m = int(row.get("pmErabRelAbnormalMmeActQci[1]", 0))
+        v_sess_s = int(row.get("pmSessionTimeDrbQci[1]", 0))
         evidence_items.append(
             {
                 "Counter / Indicator": "VoLTE QCI=1 Bearer KPI",
-                "Value": f"CSSR {volte_cssr:.2f}% | DCR {volte_dcr:.2f}%",
-                "Meaning": f"QCI=1 Att: {int(volte_cssr_denom):,} | Rel: {int(volte_dcr_denom):,}",
+                "Value": f"CSSR {volte_cssr:.2f}% (QCI1 {volte_bearer_sr:.2f}%) | DCR {volte_dcr:.2f}%",
+                "Meaning": f"Att: {int(volte_cssr_denom):,} | Drops: {v_abn_e + v_abn_m} (eNB:{v_abn_e}, MME:{v_abn_m}) / {int(volte_dcr_denom):,} rel | {v_sess_s:,}s",
             }
         )
 
@@ -1612,10 +1668,31 @@ def analyze_counter_dump(
         suffix = Path(source_name).suffix.lower()
 
     sheets_loaded: List[str] = []
+    data_warnings: List[str] = []
     kpi_frames: List[pd.DataFrame] = []
     cqi_long_frames: List[pd.DataFrame] = []
     qci_long_frames: List[pd.DataFrame] = []
     prb_frames: List[pd.DataFrame] = []
+
+    def _route_normalized_sheet(norm_df: pd.DataFrame, label: str) -> None:
+        norm_df = _normalize_and_validate_bare_qci(norm_df, label, data_warnings)
+        kind = _classify_sheet(norm_df)
+        if kind == "cqi_vector_long":
+            cqi_long_frames.append(norm_df)
+            if any(c.startswith("pm") and c.endswith("Qci") for c in norm_df.columns):
+                qci_long_frames.append(norm_df)
+            sheets_loaded.append(label)
+        elif kind == "qci_vector_long":
+            qci_long_frames.append(norm_df)
+            sheets_loaded.append(label)
+        elif kind == "prb_spectrum":
+            prb_frames.append(norm_df)
+            sheets_loaded.append(label)
+        elif kind == "kpi_main":
+            kpi_frames.append(norm_df)
+            if len([c for c in norm_df.columns if c.startswith("pmRadioRecInterferencePwrPrb")]) >= 10:
+                prb_frames.append(norm_df)
+            sheets_loaded.append(label)
 
     if suffix == ".csv":
         try:
@@ -1648,16 +1725,7 @@ def analyze_counter_dump(
             on_bad_lines="skip",
         )
         norm_df = normalize_columns(_detect_and_promote_header(raw_df))
-        sheets_loaded.append("CSV_Dump")
-        kind = _classify_sheet(norm_df)
-        if kind == "cqi_vector_long":
-            cqi_long_frames.append(norm_df)
-        elif kind == "qci_vector_long":
-            qci_long_frames.append(norm_df)
-        elif kind == "prb_spectrum":
-            prb_frames.append(norm_df)
-        else:
-            kpi_frames.append(norm_df)
+        _route_normalized_sheet(norm_df, "CSV_Dump")
     else:
         engine = "xlrd" if suffix == ".xls" else "openpyxl"
         xl = pd.ExcelFile(io.BytesIO(raw_bytes), engine=engine)
@@ -1668,19 +1736,7 @@ def analyze_counter_dump(
             norm_df = normalize_columns(_detect_and_promote_header(raw_df))
             if norm_df.empty:
                 continue
-            kind = _classify_sheet(norm_df)
-            if kind == "kpi_main":
-                kpi_frames.append(norm_df)
-                sheets_loaded.append(s_name)
-            elif kind == "cqi_vector_long":
-                cqi_long_frames.append(norm_df)
-                sheets_loaded.append(s_name)
-            elif kind == "qci_vector_long":
-                qci_long_frames.append(norm_df)
-                sheets_loaded.append(s_name)
-            elif kind == "prb_spectrum":
-                prb_frames.append(norm_df)
-                sheets_loaded.append(s_name)
+            _route_normalized_sheet(norm_df, s_name)
 
     if qci_long_frames:
         piv_qci = _pivot_qci_long_sheet(pd.concat(qci_long_frames, ignore_index=True))
@@ -2053,7 +2109,11 @@ def analyze_counter_dump(
         )
         cell_df["VoLTE_CSSR_Denom"] = v_raw_att
 
-    if "pmErabEstabAttInitQci[5]" in present_counters and cell_df["pmErabEstabAttInitQci[5]"].sum() > 0:
+    has_qci5 = bool(
+        "pmErabEstabAttInitQci[5]" in present_counters
+        and float(cell_df["pmErabEstabAttInitQci[5]"].sum()) > 0
+    )
+    if has_qci5:
         qci5_erab_sr = np.where(
             cell_df["pmErabEstabAttInitQci[5]"] > 0,
             np.clip(cell_df["pmErabEstabSuccInitQci[5]"] / np.maximum(cell_df["pmErabEstabAttInitQci[5]"], 1.0), 0.0, 1.0),
@@ -2063,6 +2123,7 @@ def analyze_counter_dump(
     else:
         cssr_qci5 = cell_df["CSSR"].values
 
+    cell_df["Has_QCI5"] = has_qci5
     cell_df["CSSR_Default_Bearer_QCI5"] = cssr_qci5
     cell_df["VoLTE_Bearer_SR"] = v_bearer_sr
     cell_df["VoLTE_CSSR"] = (cssr_qci5 / 100.0) * v_bearer_sr
@@ -2185,7 +2246,7 @@ def analyze_counter_dump(
 
     # --- Execute Decision Trees across all evaluated cells ---
     rca_records = [
-        _diagnose_cell_row(row, has_irat=has_irat, has_volte=has_volte)
+        _diagnose_cell_row(row, has_irat=has_irat, has_volte=has_volte, has_qci5=has_qci5)
         for _, row in cell_df.iterrows()
     ]
     rca_df = pd.DataFrame(rca_records)
@@ -2283,6 +2344,7 @@ def analyze_counter_dump(
         has_volte_counters=has_volte,
         has_prb_spectrum=has_prb,
         has_3gpp_dcr_denom=has_3gpp_dcr_denom,
+        data_warnings=data_warnings,
     )
 
 
