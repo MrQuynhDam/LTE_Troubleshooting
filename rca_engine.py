@@ -1,12 +1,14 @@
 """
-Ericsson LTE RAN Performance Troubleshooting & Root-Cause Prediction Engine (v6.0.0).
+Ericsson LTE RAN Performance Troubleshooting & Root-Cause Prediction Engine (v8.0.0).
 
 Implements ETL ingestion (CSV / multi-sheet Excel with metadata headers),
 exact 3GPP/Ericsson MOM composite KPI calculations (CSSR, 3GPP Overall DCR,
-eNB DCR, Session-Normalized Drop Rate, HOSR, CQI/HomCQI/MIMO/PRB Interference,
-3G/4G IRAT Ping-Pong, and 23.Q3+ VoLTE QCI=1/QCI=5 KPIs), statistical sample-size
-validation (Rule of Minimum Denominator), deterministic multi-domain RCA
-decision trees (Trees 4.1 - 4.7), and automated AMOS/Moshell CLI remediation scripts.
+eNB DCR, Session-Normalized Drop Rate, Intra-Freq HOSR, Inter-Freq HOSR,
+Combined LTE HOSR, CQI/HomCQI/MIMO/PRB Interference, 3G/4G IRAT Ping-Pong,
+and VoLTE QCI=1/QCI=5 KPIs), statistical sample-size validation (Rule of
+Minimum Denominator), deterministic multi-domain RCA decision trees with explicit
+Handover Phase separation (Preparation Phase vs Execution Phase, Trees 4.1 - 4.7),
+and automated AMOS/Moshell CLI remediation scripts.
 """
 
 from __future__ import annotations
@@ -43,6 +45,22 @@ KPI_BASELINES = {
     "CSSR": {"target": 98.5, "degraded": 97.0, "critical": 95.0, "min_denom": 30},
     "DCR": {"target": 0.5, "degraded": 1.0, "critical": 2.5, "min_denom": 30},
     "DCR_NORM": {"target": 5.0, "degraded": 10.0, "critical": 25.0, "min_denom": 3600},
+    "INTRA_HOSR": {
+        "target": 98.5,
+        "degraded": 96.0,
+        "critical": 92.0,
+        "prep_deg": 98.5,
+        "exe_deg": 99.0,
+        "min_denom": 20,
+    },
+    "INTER_HOSR": {
+        "target": 97.0,
+        "degraded": 94.0,
+        "critical": 88.0,
+        "prep_deg": 98.0,
+        "exe_deg": 98.5,
+        "min_denom": 20,
+    },
     "HOSR": {"target": 98.0, "degraded": 95.0, "critical": 90.0, "min_denom": 20},
     "CQI_AVG": {"target": 9.0, "degraded": 7.5, "critical": 6.0, "min_denom": 100},
     "CQI_LOW": {"target": 15.0, "degraded": 30.0, "critical": 50.0, "min_denom": 100},
@@ -130,6 +148,7 @@ SCALAR_COUNTERS: List[str] = [
     "pmS1SigConnEstabAtt",
     "pmS1SigConnEstabSucc",
     "pmS1SigConnEstabFailMmeOvlMos",
+    "pmS1SigConnEstabFailMmeOvlMosCe",
     "pmErabEstabAttInit",
     "pmErabEstabSuccInit",
     "pmErabEstabFailInitLic",
@@ -222,7 +241,6 @@ COUNTER_LOWER_MAP: Dict[str, str] = {c.lower(): c for c in SCALAR_COUNTERS}
 COUNTER_LOWER_MAP.update(
     {
         # Legacy / variant OSS exports
-        "pms1sigconnestabfailmmeovlmosce": "pmS1SigConnEstabFailMmeOvlMos",
         "utrancellrelation_pmhoprepatt": "UtranCellRelation.pmHoPrepAtt",
         "utrancellrelation_pmhoprepsucc": "UtranCellRelation.pmHoPrepSucc",
         "utrancellrelation_pmhoexeatt": "UtranCellRelation.pmHoExeAtt",
@@ -731,6 +749,18 @@ def _diagnose_cell_row(
     ho_prep_sr = float(row.get("HO_Prep_SR", 100.0))
     ho_exe_sr = float(row.get("HO_Exe_SR", 100.0))
 
+    intra_hosr = float(row.get("Intra_HOSR", 100.0))
+    intra_prep_sr = float(row.get("Intra_HO_Prep_SR", 100.0))
+    intra_exe_sr = float(row.get("Intra_HO_Exe_SR", 100.0))
+    intra_prep_denom = float(row.get("Intra_HO_Prep_Denom", 0.0))
+    intra_exe_denom = float(row.get("Intra_HO_Exe_Denom", 0.0))
+
+    inter_hosr = float(row.get("Inter_HOSR", 100.0))
+    inter_prep_sr = float(row.get("Inter_HO_Prep_SR", 100.0))
+    inter_exe_sr = float(row.get("Inter_HO_Exe_SR", 100.0))
+    inter_prep_denom = float(row.get("Inter_HO_Prep_Denom", 0.0))
+    inter_exe_denom = float(row.get("Inter_HO_Exe_Denom", 0.0))
+
     avg_cqi = float(row.get("Avg_CQI", 10.0)) if pd.notna(row.get("Avg_CQI")) else 10.0
     low_cqi = float(row.get("Low_CQI_Ratio", 0.0)) if pd.notna(row.get("Low_CQI_Ratio")) else 0.0
     cqi_samples = float(row.get("CQI_Samples", 0.0))
@@ -753,10 +783,16 @@ def _diagnose_cell_row(
     volte_dcr_denom = float(row.get("VoLTE_DCR_Denom", 0.0))
     volte_dcr_norm = float(row.get("VoLTE_DCR_Norm", 0.0))
 
-    # Step 0: Statistical Significance & Minimum Sample Thresholds (Section 2.8)
+    # Step 0: Statistical Significance & Minimum Sample Thresholds (v8.0.0 Section 2.9)
     valid_cssr = cssr_denom >= KPI_BASELINES["CSSR"]["min_denom"]
     valid_dcr = dcr_denom >= KPI_BASELINES["DCR"]["min_denom"]
     valid_dcr_norm = session_time >= KPI_BASELINES["DCR_NORM"]["min_denom"]
+    valid_intra_prep = intra_prep_denom >= KPI_BASELINES["INTRA_HOSR"]["min_denom"]
+    valid_intra_exe = intra_exe_denom >= KPI_BASELINES["INTRA_HOSR"]["min_denom"]
+    valid_intra_ho = valid_intra_prep or valid_intra_exe
+    valid_inter_prep = inter_prep_denom >= KPI_BASELINES["INTER_HOSR"]["min_denom"]
+    valid_inter_exe = inter_exe_denom >= KPI_BASELINES["INTER_HOSR"]["min_denom"]
+    valid_inter_ho = valid_inter_prep or valid_inter_exe
     valid_ho = ho_denom >= KPI_BASELINES["HOSR"]["min_denom"]
     valid_cqi = cqi_samples >= KPI_BASELINES["CQI_AVG"]["min_denom"]
     valid_irat = has_irat and (irat_denom >= KPI_BASELINES["IRAT_PP"]["min_denom"])
@@ -776,10 +812,20 @@ def _diagnose_cell_row(
             f"Cell {cell} excluded from degradation list due to insufficient sample size "
             f"(Sample = {int(cssr_denom)} < 30 attempts)."
         )
+    if not valid_intra_ho and intra_hosr < 96.0 and intra_prep_denom > 0:
+        low_sample_notes.append(
+            f"Cell {cell} excluded from Intra-Freq HO degradation list due to insufficient sample size "
+            f"(Sample = {int(intra_prep_denom)} < 20 Intra-Freq HO attempts)."
+        )
+    if not valid_inter_ho and inter_hosr < 94.0 and inter_prep_denom > 0:
+        low_sample_notes.append(
+            f"Cell {cell} excluded from Inter-Freq HO degradation list due to insufficient sample size "
+            f"(Sample = {int(inter_prep_denom)} < 20 Inter-Freq HO attempts)."
+        )
     if not valid_ho and hosr < 95.0 and ho_denom > 0:
         low_sample_notes.append(
-            f"Cell {cell} excluded from degradation list due to insufficient sample size "
-            f"(Sample = {int(ho_denom)} < 20 HO attempts)."
+            f"Cell {cell} excluded from Combined HO degradation list due to insufficient sample size "
+            f"(Sample = {int(ho_denom)} < 20 LTE HO attempts)."
         )
 
     # ------------------------------------------------------------------
@@ -789,6 +835,9 @@ def _diagnose_cell_row(
     ra_ooc = float(row.get("pmRaFailCbraMsg1DiscOoc", 0.0))
     ra_sched = float(row.get("pmRaFailCbraMsg1DiscSched", 0.0))
     ooc_ratio = (ra_ooc / ra_att * 100.0) if ra_att > 0 else 0.0
+    gbr_fail_all = float(row.get("pmErabEstabFailGbrDlEnb", 0.0)) + float(
+        row.get("pmErabEstabFailGbrUlEnb", 0.0)
+    )
 
     if valid_cssr and cssr < 97.0:
         sev = 3 if cssr < 95.0 else 2
@@ -797,19 +846,19 @@ def _diagnose_cell_row(
         rrc_du = float(row.get("pmRrcConnEstabFailDuIntens", 0.0))
         mme_ovl = (
             float(row.get("pmS1SigConnEstabFailMmeOvlMos", 0.0))
+            + float(row.get("pmS1SigConnEstabFailMmeOvlMosCe", 0.0))
             + float(row.get("pmRrcConnEstabFailMmeOvlMos", 0.0))
             + float(row.get("pmRrcConnEstabFailMmeOvlMod", 0.0))
         )
         erab_lic = float(row.get("pmErabEstabFailInitLic", 0.0))
-        gbr_fail = float(row.get("pmErabEstabFailGbrDlEnb", 0.0)) + float(
-            row.get("pmErabEstabFailGbrUlEnb", 0.0)
-        )
+        gbr_fail = gbr_fail_all
 
         if rrc_sr < 97.0:
             if rrc_lic > 0:
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "RRC Setup Phase",
                     "category": "License Congestion",
                     "cause": "License Limitation - Connected Users License Exceeded",
                     "confidence": 96,
@@ -820,6 +869,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "RRC Setup Phase",
                     "category": "Hardware / Baseband / RRU-RET",
                     "cause": "Baseband / MP CPU Hardware Overload",
                     "confidence": 93,
@@ -830,6 +880,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "RRC Setup Phase",
                     "category": "RACH Overshooting (OOC)",
                     "cause": f"Overshooting Cell / Timing Advance Out of Range ({ooc_ratio:.1f}% OOC)",
                     "confidence": 94,
@@ -840,6 +891,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "RRC Setup Phase",
                     "category": "UL Interference / PIM",
                     "cause": f"Uplink Interference ({ul_intf:.1f} dBm) Blocking RACH Msg3 Detection",
                     "confidence": 92,
@@ -850,6 +902,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "RRC Setup Phase",
                     "category": "PRB / CCE / GBR Congestion",
                     "cause": "Downlink Control Channel (PDCCH/CCE) Congestion or Weak CCE Coverage",
                     "confidence": 87,
@@ -861,6 +914,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "S1-C Signaling Phase",
                     "category": "Transport / Core (S1/MME)",
                     "cause": "Core Network MME Signaling Overload",
                     "confidence": 94,
@@ -871,6 +925,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "S1-C Signaling Phase",
                     "category": "Transport / Core (S1/MME)",
                     "cause": "S1 Transport Bounded Latency / SCTP Transmission Drops",
                     "confidence": 88,
@@ -882,6 +937,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "E-RAB Setup Phase",
                     "category": "License Congestion",
                     "cause": "License Limitation - E-RAB / RLC UM License Shortage",
                     "confidence": 95,
@@ -892,6 +948,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "E-RAB Setup Phase",
                     "category": "PRB / CCE / GBR Congestion",
                     "cause": "GBR Resource Admission Failure (DL/UL Bandwidth Congestion)",
                     "confidence": 92,
@@ -902,6 +959,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "CSSR",
+                    "phase": "E-RAB Setup Phase",
                     "category": "Transport / Core (S1/MME)",
                     "cause": "Radio Bearer Allocation Failure during Initial Context Setup",
                     "confidence": 85,
@@ -912,6 +970,7 @@ def _diagnose_cell_row(
         findings.append({
             "severity": 2,
             "domain": "RACH",
+            "phase": "RACH Preamble Phase",
             "category": "RACH Overshooting (OOC)",
             "cause": f"Overshooting Cell / Timing Advance Out of Range ({ooc_ratio:.1f}% Msg1 OOC Discards)",
             "confidence": 92,
@@ -927,6 +986,7 @@ def _diagnose_cell_row(
     tot_act_drops = abn_enb + abn_mme
 
     abn_ue_lost = float(row.get("pmErabRelAbnormalEnbActUeLost", 0.0))
+    abn_oos = float(row.get("pmErabRelAbnormalEnbUeLostOos", 0.0))
     abn_ho = float(row.get("pmErabRelAbnormalEnbActHo", 0.0))
     abn_tn = float(row.get("pmErabRelAbnormalEnbActTnFail", 0.0))
     abn_pe = float(row.get("pmErabRelAbnormalEnbActPe", 0.0))
@@ -940,7 +1000,6 @@ def _diagnose_cell_row(
             if dcr_overall > 2.5 or (valid_dcr_norm and dcr_norm > 25.0)
             else 2
         )
-        # v6.0.0 Tree 4.2: all breakdown shares divide by (pmErabRelAbnormalEnbAct + pmErabRelAbnormalMmeAct)
         ue_lost_share = (abn_ue_lost / tot_act_drops) if tot_act_drops > 0 else 0.0
         ho_drop_share = (abn_ho / tot_act_drops) if tot_act_drops > 0 else 0.0
         tn_drop_share = (abn_tn / tot_act_drops) if tot_act_drops > 0 else 0.0
@@ -953,6 +1012,7 @@ def _diagnose_cell_row(
                     findings.append({
                         "severity": sev,
                         "domain": "Overall DCR",
+                        "phase": "Radio Link Failure",
                         "category": "UL Interference / PIM",
                         "cause": f"Passive Intermodulation (PIM) or Narrowband External Interference (Crest +{prb_crest:.1f} dB)",
                         "confidence": 96,
@@ -963,6 +1023,7 @@ def _diagnose_cell_row(
                     findings.append({
                         "severity": sev,
                         "domain": "Overall DCR",
+                        "phase": "Radio Link Failure",
                         "category": "UL Interference / PIM",
                         "cause": f"Broadband Uplink External Interference ({ul_intf:.1f} dBm/PRB)",
                         "confidence": 95,
@@ -973,6 +1034,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "Overall DCR",
+                    "phase": "Radio Link Failure",
                     "category": "RF Weak Coverage / UL Power",
                     "cause": f"Severe Downlink Weak Coverage / Coverage Hole (Avg CQI {avg_cqi:.1f})",
                     "confidence": 93,
@@ -984,6 +1046,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "Overall DCR",
+                    "phase": "Radio Link Failure",
                     "category": "RF Weak Coverage / UL Power",
                     "cause": f"Uplink Power Control Bottleneck / UE Transmit Power Limited (UE Lost {ue_lost_share*100:.0f}%)",
                     "confidence": conf,
@@ -991,30 +1054,43 @@ def _diagnose_cell_row(
                     "scenario": "C_ULPC",
                 })
         elif ho_drop_share > 0.30:
-            if hosr < 90.0:
+            any_hosr_lt_90 = (
+                (valid_intra_ho and intra_hosr < 90.0)
+                or (valid_inter_ho and inter_hosr < 90.0)
+                or (valid_ho and hosr < 90.0)
+            )
+            ho_sc = (
+                "C2_INTER_HO"
+                if (valid_inter_ho and inter_hosr < 90.0 and not (valid_intra_ho and intra_hosr < 90.0))
+                else "C1_INTRA_HO"
+            )
+            if any_hosr_lt_90:
                 findings.append({
                     "severity": sev,
                     "domain": "Overall DCR",
+                    "phase": "Handover Execution",
                     "category": "Event B2/A2 & Mobility Tuning",
                     "cause": "Handover Execution Failure / Missing Neighbor Relations",
                     "confidence": 94,
                     "recommendation": "Audit ANR settings, check X2 interface availability, and review a3Offset/timeToTrigger.",
-                    "scenario": "C_HO",
+                    "scenario": ho_sc,
                 })
             else:
                 findings.append({
                     "severity": sev,
                     "domain": "Overall DCR",
+                    "phase": "Handover Execution",
                     "category": "Event B2/A2 & Mobility Tuning",
                     "cause": "Late Handover / Ping-Pong Handover in High Mobility Zone",
                     "confidence": 90,
                     "recommendation": "Increase hysteresisA3, decrease timeToTrigger, and enable Speed Dependent Mobility.",
-                    "scenario": "C_HO",
+                    "scenario": "C1_INTRA_HO",
                 })
         elif tn_drop_share > 0.20:
             findings.append({
                 "severity": sev,
                 "domain": "Overall DCR",
+                "phase": "Transport Layer",
                 "category": "Transport / Core (S1/MME)",
                 "cause": "Backhaul Transport Network Instability / S1 Link Flapping",
                 "confidence": 95,
@@ -1025,6 +1101,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "Overall DCR",
+                "phase": "EPC / MME Core",
                 "category": "Transport / Core (S1/MME)",
                 "cause": f"Core Network MME Initiated Session Drop / EPC Bearer Release ({mme_drop_share*100:.0f}% MME Active Drops)",
                 "confidence": 92,
@@ -1035,6 +1112,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "Overall DCR",
+                "phase": "ARP Pre-emption",
                 "category": "PRB / CCE / GBR Congestion",
                 "cause": "Pre-emption Drop due to High Priority ARP Bearer Admission",
                 "confidence": 93,
@@ -1045,6 +1123,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "Overall DCR",
+                "phase": "Radio Link Failure",
                 "category": "RF Weak Coverage / UL Power",
                 "cause": "Composite E-RAB Abnormal Release (RF Fading & Signaling Timeout)",
                 "confidence": 83,
@@ -1053,68 +1132,231 @@ def _diagnose_cell_row(
             })
 
     # ------------------------------------------------------------------
-    # TREE 4.3: HANDOVER FAILURE (HOSR < 95.0%)
+    # TREE 4.3: INTRA-FREQUENCY HANDOVER RCA (Prep Phase vs Exe Phase, v8.0.0)
     # ------------------------------------------------------------------
-    if valid_ho and hosr < 95.0:
-        sev = 3 if hosr < 90.0 else 2
-        ho_lic_rej = float(row.get("pmHoPrepRejInLicConnUsers", 0.0))
-        ho_ul_rej = float(row.get("pmHoPrepRejOutUlThres", 0.0))
+    ho_lic_rej = float(row.get("pmHoPrepRejInLicConnUsers", 0.0))
+    ho_ul_rej = float(row.get("pmHoPrepRejOutUlThres", 0.0))
+    ho_tree_triggered = False
 
-        if ho_prep_sr < 95.0:
+    if valid_intra_ho and intra_hosr < 96.0:
+        ho_tree_triggered = True
+        sev = 3 if intra_hosr < 92.0 else 2
+        intra_prep_fail = valid_intra_prep and (intra_prep_sr < 98.5)
+        intra_exe_fail = (valid_intra_exe and (intra_exe_sr < 99.0)) or (not intra_prep_fail)
+        prep_dom = (100.0 - intra_prep_sr) >= (100.0 - intra_exe_sr)
+
+        if intra_prep_fail:
+            p_boost = 2 if (intra_exe_fail and prep_dom) else 0
             if ho_lic_rej > 0:
                 findings.append({
                     "severity": sev,
-                    "domain": "HOSR",
+                    "domain": "Intra-Freq HOSR",
+                    "phase": "Preparation Phase",
                     "category": "License Congestion",
-                    "cause": "Target Cell License Rejection - Connected Users Exceeded",
-                    "confidence": 95,
-                    "recommendation": "Expand Connected Users License on target eNodeB.",
+                    "cause": f"Intra-Freq Prep Failure - Target Cell Connected Users License Limit Exceeded (Prep {intra_prep_sr:.2f}%)",
+                    "confidence": min(98, 96 + p_boost),
+                    "recommendation": "Expand Connected Users License on target eNodeB or adjust Dynamic Load Control (DLC).",
                     "scenario": "B_LIC",
                 })
             elif ho_ul_rej > 0:
                 findings.append({
                     "severity": sev,
-                    "domain": "HOSR",
+                    "domain": "Intra-Freq HOSR",
+                    "phase": "Preparation Phase",
                     "category": "UL Interference / PIM",
-                    "cause": "Target Cell Bad Uplink Quality Rejection",
-                    "confidence": 91,
-                    "recommendation": "Clear target cell UL interference, optimize target cell tilt.",
+                    "cause": f"Intra-Freq Prep Failure - Target Cell High Uplink Interference / Bad Quality (Prep {intra_prep_sr:.2f}%)",
+                    "confidence": min(97, 93 + p_boost),
+                    "recommendation": "Investigate UL PIM/external interference on target cell; optimize target cell tilt/power.",
                     "scenario": "A_PIM",
                 })
-            else:
+            elif (ra_att > 0 and (ra_sched / ra_att) > 0.01) or gbr_fail_all > 0:
                 findings.append({
                     "severity": sev,
-                    "domain": "HOSR",
+                    "domain": "Intra-Freq HOSR",
+                    "phase": "Preparation Phase",
                     "category": "PRB / CCE / GBR Congestion",
-                    "cause": "Target Cell Capacity / CCE / PRB Congestion",
-                    "confidence": 88,
-                    "recommendation": "Enable Inter-Frequency Load Balancing (IFLB) to shift traffic before HO.",
-                    "scenario": "C_HO",
-                })
-        else:
-            if abn_ho > 50:
-                findings.append({
-                    "severity": sev,
-                    "domain": "HOSR",
-                    "category": "Event B2/A2 & Mobility Tuning",
-                    "cause": f"Physical Layer Handover Execution Collapse ({hosr:.2f}% HOSR, Severe Cell-Edge Interference)",
-                    "confidence": 93,
-                    "recommendation": "Adjust a3Offset (e.g. from 3dB to 2dB) for earlier HO triggering; check PCI collision/confusion.",
-                    "scenario": "C_HO",
+                    "cause": f"Intra-Freq Prep Failure - Target Cell Control Channel / Resource Congestion (Prep {intra_prep_sr:.2f}%)",
+                    "confidence": min(96, 90 + p_boost),
+                    "recommendation": "Enable IFLB to offload target cell before HO or enable pdcchCceOptimizationEnabled.",
+                    "scenario": "C1_INTRA_HO",
                 })
             else:
                 findings.append({
                     "severity": sev,
-                    "domain": "HOSR",
+                    "domain": "Intra-Freq HOSR",
+                    "phase": "Preparation Phase",
                     "category": "Event B2/A2 & Mobility Tuning",
-                    "cause": f"Missing External Cell Definition / ANR Blocked Neighbor ({hosr:.2f}% HOSR)",
-                    "confidence": 90,
-                    "recommendation": "Check AnrFunction.anrState, force manual relation creation on EUtranCellRelation.",
-                    "scenario": "C_HO",
+                    "cause": f"Intra-Freq Prep Failure - Neighbor Relation Misconfiguration or X2 Transport Flap (Prep {intra_prep_sr:.2f}%)",
+                    "confidence": min(96, 91 + p_boost),
+                    "recommendation": "Check X2 IP link availability, verify EUtranCellRelation.hoAllowed status, and audit ANR.",
+                    "scenario": "C1_INTRA_HO",
+                })
+
+        if intra_exe_fail:
+            e_boost = 2 if (intra_prep_fail and not prep_dom) else 0
+            intra_ho_drop_ratio = (abn_ho / intra_exe_denom) if intra_exe_denom > 0 else 0.0
+            if intra_ho_drop_ratio > 0.05 and (avg_cqi < 8.5 or low_cqi > 25.0):
+                findings.append({
+                    "severity": sev,
+                    "domain": "Intra-Freq HOSR",
+                    "phase": "Execution Phase",
+                    "category": "Event B2/A2 & Mobility Tuning",
+                    "cause": f"Intra-Freq Exe Failure - Late Handover (Triggered Too Late in Coverage Hole, Exe {intra_exe_sr:.2f}%)",
+                    "confidence": min(98, 94 + e_boost),
+                    "recommendation": "Lower a3Offset (e.g., from 30 [3.0dB] to 15 [1.5dB]) and reduce timeToTrigger (e.g., from 100ms to 40ms).",
+                    "scenario": "C1_INTRA_HO",
+                })
+            elif ul_intf > -110.0 or abn_oos > 5.0:
+                findings.append({
+                    "severity": sev,
+                    "domain": "Intra-Freq HOSR",
+                    "phase": "Execution Phase",
+                    "category": "UL Interference / PIM",
+                    "cause": f"Intra-Freq Exe Failure - PCI Collision or Severe Co-Channel Interference (Exe {intra_exe_sr:.2f}%)",
+                    "confidence": min(97, 92 + e_boost),
+                    "recommendation": "Audit PCI planning (check PCI collision/confusion), resolve co-channel overlap.",
+                    "scenario": "C1_INTRA_HO",
+                })
+            elif intra_ho_drop_ratio > 0.02:
+                findings.append({
+                    "severity": sev,
+                    "domain": "Intra-Freq HOSR",
+                    "phase": "Execution Phase",
+                    "category": "Event B2/A2 & Mobility Tuning",
+                    "cause": f"Intra-Freq Exe Failure - Early Handover / Ping-Pong Handover in High Interference Zone (Exe {intra_exe_sr:.2f}%)",
+                    "confidence": min(96, 91 + e_boost),
+                    "recommendation": "Increase hysteresisA3 (e.g., to 20 [2.0dB]) and enable Speed Dependent Mobility.",
+                    "scenario": "C1_INTRA_HO",
+                })
+            else:
+                findings.append({
+                    "severity": sev,
+                    "domain": "Intra-Freq HOSR",
+                    "phase": "Execution Phase",
+                    "category": "Event B2/A2 & Mobility Tuning",
+                    "cause": f"Intra-Freq Exe Failure - Physical Layer Disruption / UE Detach at Cell Edge (Intra HOSR {intra_hosr:.2f}%, Exe {intra_exe_sr:.2f}%)",
+                    "confidence": min(96, 90 + e_boost),
+                    "recommendation": "Inspect antenna physical tilt/azimuth alignment and check optical SFP link.",
+                    "scenario": "C1_INTRA_HO",
                 })
 
     # ------------------------------------------------------------------
-    # TREE 4.4: LOW CQI / RADIO INTERFERENCE DEGRADATION
+    # TREE 4.4: INTER-FREQUENCY HANDOVER RCA (Prep Phase vs Exe Phase, v8.0.0)
+    # ------------------------------------------------------------------
+    rrc_succ = float(row.get("pmRrcConnEstabSucc", 0.0))
+    bad_cov_rep = max(
+        float(row.get("pmBadCovEvalReport", 0.0)),
+        float(row.get("pmBadCovSearchEvalReport", 0.0)),
+    )
+
+    if valid_inter_ho and inter_hosr < 94.0:
+        ho_tree_triggered = True
+        sev = 3 if inter_hosr < 88.0 else 2
+        inter_prep_fail = valid_inter_prep and (inter_prep_sr < 98.0)
+        inter_exe_fail = (valid_inter_exe and (inter_exe_sr < 98.5)) or (not inter_prep_fail)
+        inter_prep_dom = (100.0 - inter_prep_sr) >= (100.0 - inter_exe_sr)
+
+        if inter_prep_fail:
+            ip_boost = 2 if (inter_exe_fail and inter_prep_dom) else 0
+            if ho_lic_rej > 0:
+                findings.append({
+                    "severity": sev,
+                    "domain": "Inter-Freq HOSR",
+                    "phase": "Preparation Phase",
+                    "category": "License Congestion",
+                    "cause": f"Inter-Freq Prep Failure - Target Inter-Freq Cell License Exceeded (Prep {inter_prep_sr:.2f}%)",
+                    "confidence": min(98, 96 + ip_boost),
+                    "recommendation": "Upgrade Connected Users License on target frequency eNodeB.",
+                    "scenario": "B_LIC",
+                })
+            elif gbr_fail_all > 0 or ho_ul_rej > 0:
+                findings.append({
+                    "severity": sev,
+                    "domain": "Inter-Freq HOSR",
+                    "phase": "Preparation Phase",
+                    "category": "PRB / CCE / GBR Congestion",
+                    "cause": f"Inter-Freq Prep Failure - Target Frequency Capacity Limit Reached (Prep {inter_prep_sr:.2f}%)",
+                    "confidence": min(96, 92 + ip_boost),
+                    "recommendation": "Adjust GBR CAC parameters or shift Inter-Freq steering priorities.",
+                    "scenario": "C2_INTER_HO",
+                })
+            else:
+                findings.append({
+                    "severity": sev,
+                    "domain": "Inter-Freq HOSR",
+                    "phase": "Preparation Phase",
+                    "category": "Event B2/A2 & Mobility Tuning",
+                    "cause": f"Inter-Freq Prep Failure - Target Inter-Freq Neighbor Relation Blocked (Prep {inter_prep_sr:.2f}%)",
+                    "confidence": min(96, 91 + ip_boost),
+                    "recommendation": "Check EUtranFreqRelation / EUtranCellRelation hoAllowed and isRemoveAllowed settings.",
+                    "scenario": "C2_INTER_HO",
+                })
+
+        if inter_exe_fail:
+            ie_boost = 2 if (inter_prep_fail and not inter_prep_dom) else 0
+            inter_ho_drop_ratio = (abn_ho / inter_exe_denom) if inter_exe_denom > 0 else 0.0
+            if inter_ho_drop_ratio > 0.05 or (rrc_succ > 0 and (bad_cov_rep / rrc_succ) > 0.30):
+                findings.append({
+                    "severity": sev,
+                    "domain": "Inter-Freq HOSR",
+                    "phase": "Execution Phase",
+                    "category": "Event B2/A2 & Mobility Tuning",
+                    "cause": f"Inter-Freq Exe Failure - Aggressive Event A2 / Late Event A5 Triggering (Inter HOSR {inter_hosr:.2f}%, Exe {inter_exe_sr:.2f}%)",
+                    "confidence": min(97, 93 + ie_boost),
+                    "recommendation": "Raise a2Threshold1Rsrp (trigger search earlier) and adjust a5Threshold1Rsrp / a5Threshold2Rsrp.",
+                    "scenario": "C2_INTER_HO",
+                })
+            elif valid_cqi and (avg_cqi < 8.0 or low_cqi > 25.0):
+                findings.append({
+                    "severity": sev,
+                    "domain": "Inter-Freq HOSR",
+                    "phase": "Execution Phase",
+                    "category": "RF Weak Coverage / UL Power",
+                    "cause": f"Inter-Freq Exe Failure - Target Frequency Weak Coverage Footprint (Inter HOSR {inter_hosr:.2f}%, Exe {inter_exe_sr:.2f}%)",
+                    "confidence": min(96, 91 + ie_boost),
+                    "recommendation": "Increase target frequency CRS power, adjust electrical tilt, or deploy CA secondary carrier.",
+                    "scenario": "C2_INTER_HO",
+                })
+            else:
+                findings.append({
+                    "severity": sev,
+                    "domain": "Inter-Freq HOSR",
+                    "phase": "Execution Phase",
+                    "category": "Event B2/A2 & Mobility Tuning",
+                    "cause": f"Inter-Freq Exe Failure - Inter-Frequency Carrier Sync / Blind Redirect Drop (Inter HOSR {inter_hosr:.2f}%, Exe {inter_exe_sr:.2f}%)",
+                    "confidence": min(96, 90 + ie_boost),
+                    "recommendation": "Audit target EARFCN frequency synchronization and review blind redirection parameters.",
+                    "scenario": "C2_INTER_HO",
+                })
+
+    # Combined LTE HOSR Fallback (< 95.0% when individual carrier sample < 20)
+    if valid_ho and hosr < 95.0 and not ho_tree_triggered:
+        sev = 3 if hosr < 90.0 else 2
+        if ho_prep_sr < 98.0 and (100.0 - ho_prep_sr) >= (100.0 - ho_exe_sr):
+            findings.append({
+                "severity": sev,
+                "domain": "Combined HOSR",
+                "phase": "Preparation Phase",
+                "category": "Event B2/A2 & Mobility Tuning",
+                "cause": f"Combined LTE HO Prep Failure - Target Cell Admission / Neighbor Block ({hosr:.2f}% Combined HOSR)",
+                "confidence": 90,
+                "recommendation": "Audit EUtranCellRelation.hoAllowed, target license capacity, and X2 link status.",
+                "scenario": "C1_INTRA_HO",
+            })
+        else:
+            findings.append({
+                "severity": sev,
+                "domain": "Combined HOSR",
+                "phase": "Execution Phase",
+                "category": "Event B2/A2 & Mobility Tuning",
+                "cause": f"Combined LTE HO Execution Degradation across Carrier Layers ({hosr:.2f}% Combined HOSR)",
+                "confidence": 90,
+                "recommendation": "Review Event A3/A5 handover thresholds and cell-edge dominance across carriers.",
+                "scenario": "C1_INTRA_HO",
+            })
+
+    # ------------------------------------------------------------------
+    # TREE 4.5: LOW CQI / RADIO INTERFERENCE DEGRADATION (v8.0.0)
     # ------------------------------------------------------------------
     if valid_cqi and (avg_cqi < 7.5 or low_cqi > 30.0 or ul_intf > -110.0):
         sev = 3 if (avg_cqi < 6.0 or low_cqi > 50.0 or ul_intf > -105.0) else 2
@@ -1123,6 +1365,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "CQI / RF",
+                "phase": "UL Interference",
                 "category": "UL Interference / PIM",
                 "cause": f"High Radio Noise Floor / External Interference or PIM ({ul_intf:.1f} dBm/PRB{pim_detail})",
                 "confidence": 95,
@@ -1133,6 +1376,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": 2,
                 "domain": "CQI / RF",
+                "phase": "UL Interference",
                 "category": "UL Interference / PIM",
                 "cause": f"Elevated Uplink Noise Floor ({ul_intf:.1f} dBm/PRB > -110 dBm Threshold)",
                 "confidence": 90,
@@ -1143,6 +1387,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "CQI / RF",
+                "phase": "DL Radio / SINR",
                 "category": "Hardware / Baseband / RRU-RET",
                 "cause": f"Lack of Dominant Server / Severe Pilot Pollution or RRU Branch Imbalance (Rank-1 {rank1_pct:.1f}%)",
                 "confidence": 90,
@@ -1153,6 +1398,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "CQI / RF",
+                "phase": "DL Radio / SINR",
                 "category": "UL Interference / PIM",
                 "cause": f"Frequency-Selective Subband Interference (Subband CQI Delta {subband_delta:.1f})",
                 "confidence": 89,
@@ -1163,6 +1409,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "CQI / RF",
+                "phase": "DL Radio / SINR",
                 "category": "RF Weak Coverage / UL Power",
                 "cause": f"General Low Signal-to-Noise Ratio / High Low-CQI Tail (Avg CQI {avg_cqi:.2f}, Low-CQI {low_cqi:.1f}%)",
                 "confidence": 88,
@@ -1171,16 +1418,11 @@ def _diagnose_cell_row(
             })
 
     # ------------------------------------------------------------------
-    # TREE 4.5: 3G/4G IRAT PING-PONG LOOP (v6.0.0)
+    # TREE 4.6: 3G/4G IRAT PING-PONG LOOP (v8.0.0)
     # ------------------------------------------------------------------
-    rrc_succ = float(row.get("pmRrcConnEstabSucc", 0.0))
     irat_rel_rate = (irat_denom / rrc_succ) if rrc_succ > 0 else 0.0
     if valid_irat and (irat_pp > 5.0 or irat_rel_rate > 0.25):
         sev = 3 if irat_pp > 10.0 else 2
-        bad_cov_rep = max(
-            float(row.get("pmBadCovEvalReport", 0.0)),
-            float(row.get("pmBadCovSearchEvalReport", 0.0)),
-        )
         csfb_rel = float(row.get("pmUeCtxtRelCsfbWcdma", 0.0))
         sc_wcdma = float(row.get("pmUeCtxtRelSCWcdma", 0.0))
         b2_t1 = float(row["b2Threshold1Rsdp"]) if pd.notna(row.get("b2Threshold1Rsdp")) else -108.0
@@ -1209,6 +1451,7 @@ def _diagnose_cell_row(
         findings.append({
             "severity": sev,
             "domain": "IRAT Ping-Pong",
+            "phase": "IRAT Mobility (A2/B2)",
             "category": "Event B2/A2 & Mobility Tuning",
             "cause": cause_txt,
             "confidence": 94,
@@ -1217,7 +1460,7 @@ def _diagnose_cell_row(
         })
 
     # ------------------------------------------------------------------
-    # TREE 4.6: VoLTE BAD CSSR (v6.0.0)
+    # TREE 4.7A: VoLTE BAD CSSR (v8.0.0)
     # ------------------------------------------------------------------
     vcssr_bad = (
         (volte_cssr < 97.5 or volte_bearer_sr < 98.0)
@@ -1250,6 +1493,7 @@ def _diagnose_cell_row(
         findings.append({
             "severity": sev,
             "domain": "VoLTE CSSR",
+            "phase": "VoLTE Bearer Setup",
             "category": v_cat,
             "cause": v_cause,
             "confidence": 93,
@@ -1258,7 +1502,7 @@ def _diagnose_cell_row(
         })
 
     # ------------------------------------------------------------------
-    # TREE 4.7: VoLTE HIGH DCR (v6.0.0)
+    # TREE 4.7B: VoLTE HIGH DCR (v8.0.0)
     # ------------------------------------------------------------------
     v_sess_time = float(row.get("pmSessionTimeDrbQci[1]", 0.0))
     vdcr_norm_bad = v_sess_time >= 1800.0 and volte_dcr_norm > 3.0
@@ -1279,6 +1523,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": 3,
                 "domain": "VoLTE DCR",
+                "phase": "Voice Retainability",
                 "category": "VoLTE QCI=1 Bearer / IMS",
                 "cause": "CRITICAL MISCONFIGURATION: VoLTE QCI=1 Bearer Pre-empted",
                 "confidence": 98,
@@ -1291,6 +1536,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "VoLTE DCR",
+                    "phase": "Voice Retainability",
                     "category": "UL Interference / PIM",
                     "cause": "Uplink PIM / Radio Noise Floor Destroying VoLTE RTP Packets",
                     "confidence": 95,
@@ -1301,6 +1547,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "VoLTE DCR",
+                    "phase": "Voice Retainability",
                     "category": "RF Weak Coverage / UL Power",
                     "cause": "VoLTE Weak Coverage Hole at Cell Edge",
                     "confidence": 91,
@@ -1312,6 +1559,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "VoLTE DCR",
+                    "phase": "Voice Retainability",
                     "category": "Event B2/A2 & Mobility Tuning",
                     "cause": "SRVCC Handover Execution Collapse to 2G/3G WCDMA",
                     "confidence": 94,
@@ -1322,6 +1570,7 @@ def _diagnose_cell_row(
                 findings.append({
                     "severity": sev,
                     "domain": "VoLTE DCR",
+                    "phase": "Voice Retainability",
                     "category": "Event B2/A2 & Mobility Tuning",
                     "cause": "Intra/Inter-Frequency LTE VoLTE Handover Execution Failure",
                     "confidence": 90,
@@ -1332,6 +1581,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "VoLTE DCR",
+                "phase": "Voice Retainability",
                 "category": "Transport / Core (S1/MME)",
                 "cause": "IMS Core Session Supervision Timeout / SIP BYE Abort",
                 "confidence": 92,
@@ -1342,6 +1592,7 @@ def _diagnose_cell_row(
             findings.append({
                 "severity": sev,
                 "domain": "VoLTE DCR",
+                "phase": "Voice Retainability",
                 "category": "VoLTE QCI=1 Bearer / IMS",
                 "cause": f"VoLTE Dedicated QCI=1 Voice Drop Degradation ({volte_dcr:.2f}%)",
                 "confidence": 88,
@@ -1354,6 +1605,17 @@ def _diagnose_cell_row(
     # ------------------------------------------------------------------
     ue_lost_pct = (abn_ue_lost / tot_act_drops * 100.0) if tot_act_drops > 0 else 0.0
     mme_act_pct = (abn_mme / tot_act_drops * 100.0) if tot_act_drops > 0 else 0.0
+
+    intra_ev_val = (
+        f"{intra_hosr:.2f}% (P:{intra_prep_sr:.2f}% / E:{intra_exe_sr:.2f}%)"
+        if intra_prep_denom > 0 or intra_exe_denom > 0
+        else "N/A (0 Att)"
+    )
+    inter_ev_val = (
+        f"{inter_hosr:.2f}% (P:{inter_prep_sr:.2f}% / E:{inter_exe_sr:.2f}%)"
+        if inter_prep_denom > 0 or inter_exe_denom > 0
+        else "N/A (0 Att)"
+    )
 
     evidence_items = [
         {
@@ -1387,9 +1649,14 @@ def _diagnose_cell_row(
             "Meaning": f"Core MME Active Drops | HO Drops: {int(abn_ho):,}",
         },
         {
-            "Counter / Indicator": "Handover Prep / Exe SR",
-            "Value": f"{ho_prep_sr:.2f}% / {ho_exe_sr:.2f}%",
-            "Meaning": f"Composite HOSR: {hosr:.2f}% ({int(ho_denom):,} Prep Att)",
+            "Counter / Indicator": "Intra-Freq HO (Prep / Exe)",
+            "Value": intra_ev_val,
+            "Meaning": f"Prep Att: {int(intra_prep_denom):,} | Exe Att: {int(intra_exe_denom):,}",
+        },
+        {
+            "Counter / Indicator": "Inter-Freq & Combined HO",
+            "Value": inter_ev_val,
+            "Meaning": f"Inter Att: {int(inter_prep_denom):,} | Comb LTE HOSR: {hosr:.2f}% ({int(ho_denom):,} Att)",
         },
         {
             "Counter / Indicator": "pmRadioRecInterferencePwr",
@@ -1415,7 +1682,7 @@ def _diagnose_cell_row(
             if float(row.get("UtranCellRelation.pmHoExeSucc", 0.0)) > 0
             else row.get("pmHoExeSucc", 0)
         )
-        ir_a2 = int(max(float(row.get("pmBadCovEvalReport", 0.0)), float(row.get("pmBadCovSearchEvalReport", 0.0))))
+        ir_a2 = int(bad_cov_rep)
         ir_b2 = int(row.get("pmB2BestCellEvalReport", 0))
         ir_csfb = int(row.get("pmUeCtxtRelCsfbWcdma", 0))
         a2_ratio_ev = (ir_a2 / rrc_succ * 100.0) if rrc_succ > 0 else 0.0
@@ -1450,6 +1717,7 @@ def _diagnose_cell_row(
                 "Status": "LOW_SAMPLE",
                 "Severity_Rank": 0,
                 "RCA_Category": "Low Traffic Sample (Excluded)",
+                "Isolated_Phase": "N/A",
                 "Primary_Root_Cause": excl_msg,
                 "Secondary_Causes": "None (Statistical Sample Gate Filtered)",
                 "Affected_Domain": "LOW_TRAFFIC_SAMPLE",
@@ -1463,6 +1731,7 @@ def _diagnose_cell_row(
             "Status": "NORMAL",
             "Severity_Rank": 1,
             "RCA_Category": "Normal / Healthy",
+            "Isolated_Phase": "Healthy",
             "Primary_Root_Cause": "All KPIs within 3GPP / Ericsson Target Baselines",
             "Secondary_Causes": "None",
             "Affected_Domain": "HEALTHY",
@@ -1474,7 +1743,7 @@ def _diagnose_cell_row(
 
     findings.sort(key=lambda x: (x["severity"], x["confidence"]), reverse=True)
     primary = findings[0]
-    secondary_list = [f"{f['domain']}: {f['cause']}" for f in findings[1:]]
+    secondary_list = [f"{f['domain']} [{f.get('phase', 'N/A')}]: {f['cause']}" for f in findings[1:]]
     status_str = "CRITICAL" if primary["severity"] >= 3 else "DEGRADED"
 
     scenarios = list(dict.fromkeys(f["scenario"] for f in findings))
@@ -1484,6 +1753,7 @@ def _diagnose_cell_row(
         "Status": status_str,
         "Severity_Rank": primary["severity"] + 1,  # 4=CRITICAL, 3=DEGRADED
         "RCA_Category": primary["category"],
+        "Isolated_Phase": primary.get("phase", "N/A"),
         "Primary_Root_Cause": primary["cause"],
         "Secondary_Causes": " | ".join(secondary_list) if secondary_list else "None",
         "Affected_Domain": primary["domain"],
@@ -1500,7 +1770,7 @@ def generate_amos_script(
     """Build copy-pasteable Ericsson AMOS / Moshell CLI script per Section 5.1 - 5.5."""
     lines = [
         "# ===================================================================",
-        "# ERICSSON AMOS / MOSHELL REMEDIATION PROTOCOL (v6.0)",
+        "# ERICSSON AMOS / MOSHELL REMEDIATION PROTOCOL (v8.0)",
         f"# Target Node : {enodeb}   |   Cell : {cell}",
         f"# Diagnosis   : {root_cause}",
         "# ===================================================================",
@@ -1580,16 +1850,28 @@ def generate_amos_script(
                 f"set EUtranCellFDD={cell} alpha 8",
                 f"set EUtranCellFDD={cell} ulSrsEnable true",
             ])
-        elif sc == "C_HO":
+        elif sc in ("C1_INTRA_HO", "C_HO"):
             lines.extend([
                 "",
-                "# --- Scenario C: Handover Execution Failure & ANR Neighbor Protocol ---",
-                f"pget EUtranCellFDD={cell} pmErabRelAbnormalEnbActHo|pmCellHoExeAttLteIntraF",
+                "# --- Scenario C1: Intra-Frequency Handover Remediation Protocol (Prep & Exe) ---",
+                f"pget EUtranCellFDD={cell} pmCellHoPrepAttLteIntraF|pmCellHoPrepSuccLteIntraF",
+                f"pget EUtranCellFDD={cell} pmCellHoExeAttLteIntraF|pmCellHoExeSuccLteIntraF|pmErabRelAbnormalEnbActHo",
                 f"get EUtranCellFDD={cell},EUtranCellRelation= hoAllowed|isHoAllowed|cellIndividualOffsetEUtran",
-                "get AnrFunction anrState",
-                f"set EUtranCellFDD={cell},EUtranCellRelation= hoAllowed true",
-                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigEUtraBestCell=1 a3Offset 20",
-                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigEUtraBestCell=1 timeToTrigger 80",
+                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigEUtraBestCell=1 a3Offset 15",
+                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigEUtraBestCell=1 timeToTrigger 40",
+                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigEUtraBestCell=1 hysteresisA3 20",
+            ])
+        elif sc == "C2_INTER_HO":
+            lines.extend([
+                "",
+                "# --- Scenario C2: Inter-Frequency Handover Remediation Protocol (Prep & Exe) ---",
+                f"pget EUtranCellFDD={cell} pmCellHoPrepAttLteInterF|pmCellHoPrepSuccLteInterF",
+                f"pget EUtranCellFDD={cell} pmCellHoExeAttLteInterF|pmCellHoExeSuccLteInterF",
+                f"get EUtranCellFDD={cell},EUtranFreqRelation= hoAllowed|cellReselectionPriority",
+                f"get EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 a5Threshold1Rsrp|a5Threshold2Rsrp|timeToTrigger",
+                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 a5Threshold1Rsrp -110",
+                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 a5Threshold2Rsrp -105",
+                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 timeToTrigger 80",
             ])
         elif sc == "D_IRAT":
             lines.extend([
@@ -1633,7 +1915,7 @@ def generate_amos_script(
         "",
         "confb-",
         "gs-",
-        "cvms Post_Antigravity_RCA_v6_Optimization",
+        "cvms Post_Antigravity_RCA_v8_Optimization",
     ])
     return "\n".join(lines)
 
@@ -1938,8 +2220,12 @@ def analyze_counter_dump(
         1.0,
     )
 
+    s1_mme_ovl = (
+        cell_df["pmS1SigConnEstabFailMmeOvlMos"]
+        + cell_df["pmS1SigConnEstabFailMmeOvlMosCe"]
+    )
     s1_formula_denom = np.maximum(
-        cell_df["pmS1SigConnEstabAtt"] - cell_df["pmS1SigConnEstabFailMmeOvlMos"], 0.0
+        cell_df["pmS1SigConnEstabAtt"] - s1_mme_ovl, 0.0
     )
     s1_sr = np.where(
         s1_formula_denom > 0,
@@ -2001,58 +2287,71 @@ def analyze_counter_dump(
         0.0,
     )
 
-    # 2.3 Mobility (HOSR % across IntraF, InterF, IRAT, 1xRTT SRVCC)
-    ir_prep_att = np.where(
-        cell_df["pmHoPrepAtt"] > 0,
-        cell_df["pmHoPrepAtt"],
-        cell_df["UtranCellRelation.pmHoPrepAtt"],
-    )
-    ir_prep_succ = np.where(
-        cell_df["pmHoPrepSucc"] > 0,
-        cell_df["pmHoPrepSucc"],
-        cell_df["UtranCellRelation.pmHoPrepSucc"],
-    )
-    ir_exe_att = np.where(
-        cell_df["pmHoExeAtt"] > 0,
-        cell_df["pmHoExeAtt"],
-        cell_df["UtranCellRelation.pmHoExeAtt"],
-    )
-    ir_exe_succ = np.where(
-        cell_df["pmHoExeSucc"] > 0,
-        cell_df["pmHoExeSucc"],
-        cell_df["UtranCellRelation.pmHoExeSucc"],
-    )
+    # 2.3 Intra-Frequency Mobility (v8.0.0: Separate Prep Phase SR & Exe Phase SR)
+    intra_prep_att = cell_df["pmCellHoPrepAttLteIntraF"]
+    intra_prep_succ = cell_df["pmCellHoPrepSuccLteIntraF"]
+    intra_exe_att = cell_df["pmCellHoExeAttLteIntraF"]
+    intra_exe_succ = cell_df["pmCellHoExeSuccLteIntraF"]
 
-    ho_prep_succ = (
-        cell_df["pmCellHoPrepSuccLteIntraF"]
-        + cell_df["pmCellHoPrepSuccLteInterF"]
-        + ir_prep_succ
-        + cell_df["pmHoPrepSucc1xRttSrvcc"]
+    intra_prep_rate = np.where(
+        intra_prep_att > 0,
+        np.clip(intra_prep_succ / np.maximum(intra_prep_att, 1.0), 0.0, 1.0),
+        1.0,
     )
-    ho_prep_att = (
-        cell_df["pmCellHoPrepAttLteIntraF"]
-        + cell_df["pmCellHoPrepAttLteInterF"]
-        + ir_prep_att
-        + cell_df["pmHoPrepAtt1xRttSrvcc"]
-        + cell_df["pmHoPrepRejOutUlThres"]
+    intra_exe_rate = np.where(
+        intra_exe_att > 0,
+        np.clip(intra_exe_succ / np.maximum(intra_exe_att, 1.0), 0.0, 1.0),
+        1.0,
     )
-    ho_exe_succ = (
-        cell_df["pmCellHoExeSuccLteIntraF"]
-        + cell_df["pmCellHoExeSuccLteInterF"]
-        + ir_exe_succ
-    )
-    ho_exe_att = (
-        cell_df["pmCellHoExeAttLteIntraF"]
-        + cell_df["pmCellHoExeAttLteInterF"]
-        + ir_exe_att
-    )
+    cell_df["Intra_HO_Prep_Denom"] = intra_prep_att
+    cell_df["Intra_HO_Exe_Denom"] = intra_exe_att
+    cell_df["Intra_HO_Denom"] = intra_prep_att
+    cell_df["Intra_HO_Prep_SR"] = intra_prep_rate * 100.0
+    cell_df["Intra_HO_Exe_SR"] = intra_exe_rate * 100.0
+    cell_df["Intra_HOSR"] = intra_prep_rate * intra_exe_rate * 100.0
 
-    ho_prep_rate = np.where(ho_prep_att > 0, np.clip(ho_prep_succ / np.maximum(ho_prep_att, 1.0), 0.0, 1.0), 1.0)
-    ho_exe_rate = np.where(ho_exe_att > 0, np.clip(ho_exe_succ / np.maximum(ho_exe_att, 1.0), 0.0, 1.0), 1.0)
+    # 2.4 Inter-Frequency Mobility (v8.0.0: Separate Prep Phase SR & Exe Phase SR)
+    inter_prep_raw = cell_df["pmCellHoPrepAttLteInterF"]
+    inter_prep_formula_denom = inter_prep_raw + cell_df["pmHoPrepRejOutUlThres"]
+    inter_prep_succ = cell_df["pmCellHoPrepSuccLteInterF"]
+    inter_exe_att = cell_df["pmCellHoExeAttLteInterF"]
+    inter_exe_succ = cell_df["pmCellHoExeSuccLteInterF"]
+
+    inter_prep_rate = np.where(
+        inter_prep_raw > 0,
+        np.clip(inter_prep_succ / np.maximum(inter_prep_formula_denom, 1.0), 0.0, 1.0),
+        1.0,
+    )
+    inter_exe_rate = np.where(
+        inter_exe_att > 0,
+        np.clip(inter_exe_succ / np.maximum(inter_exe_att, 1.0), 0.0, 1.0),
+        1.0,
+    )
+    cell_df["Inter_HO_Prep_Denom"] = inter_prep_raw
+    cell_df["Inter_HO_Exe_Denom"] = inter_exe_att
+    cell_df["Inter_HO_Denom"] = inter_prep_raw
+    cell_df["Inter_HO_Prep_SR"] = inter_prep_rate * 100.0
+    cell_df["Inter_HO_Exe_SR"] = inter_exe_rate * 100.0
+    cell_df["Inter_HOSR"] = inter_prep_rate * inter_exe_rate * 100.0
+
+    # 2.5 Combined LTE Mobility (v8.0.0: Pure LTE IntraF + InterF across carrier layers)
+    ho_prep_succ = intra_prep_succ + inter_prep_succ
+    ho_prep_att = intra_prep_att + inter_prep_raw + cell_df["pmHoPrepRejOutUlThres"]
+    ho_exe_succ = intra_exe_succ + inter_exe_succ
+    ho_exe_att = intra_exe_att + inter_exe_att
+
+    ho_prep_rate = np.where(
+        ho_prep_att > 0, np.clip(ho_prep_succ / np.maximum(ho_prep_att, 1.0), 0.0, 1.0), 1.0
+    )
+    ho_exe_rate = np.where(
+        ho_exe_att > 0, np.clip(ho_exe_succ / np.maximum(ho_exe_att, 1.0), 0.0, 1.0), 1.0
+    )
     cell_df["HO_Denom"] = ho_prep_att
+    cell_df["HO_Exe_Denom"] = ho_exe_att
     cell_df["HO_Prep_SR"] = ho_prep_rate * 100.0
     cell_df["HO_Exe_SR"] = ho_exe_rate * 100.0
-    cell_df["HOSR"] = ho_prep_rate * ho_exe_rate * 100.0
+    cell_df["Combined_HOSR"] = ho_prep_rate * ho_exe_rate * 100.0
+    cell_df["HOSR"] = cell_df["Combined_HOSR"]
 
     cell_df["RACH_OOC_Ratio"] = np.where(
         cell_df["pmRaAttCbra"] > 0,
@@ -2262,7 +2561,8 @@ def analyze_counter_dump(
     rop_req_cols = (
         "pmRrcConnEstabAtt", "pmRrcConnEstabAttReatt", "pmRrcConnEstabSucc",
         "pmRrcConnEstabFailMmeOvlMos", "pmRrcConnEstabFailMmeOvlMod",
-        "pmS1SigConnEstabAtt", "pmS1SigConnEstabSucc", "pmS1SigConnEstabFailMmeOvlMos",
+        "pmS1SigConnEstabAtt", "pmS1SigConnEstabSucc",
+        "pmS1SigConnEstabFailMmeOvlMos", "pmS1SigConnEstabFailMmeOvlMosCe",
         "pmErabEstabAttInit", "pmErabEstabSuccInit",
         "pmErabRelAbnormalEnb", "pmErabRelNormalEnb", "pmErabRelMme",
         "pmErabRelNormalEnbAct", "pmErabRelAbnormalEnbAct",
@@ -2288,7 +2588,10 @@ def analyze_counter_dump(
         )
         r_sr = np.where(r_denom > 0, np.clip(rop_grp["pmRrcConnEstabSucc"] / np.maximum(r_denom, 1.0), 0.0, 1.0), 1.0)
         s_denom = np.maximum(
-            rop_grp["pmS1SigConnEstabAtt"] - rop_grp["pmS1SigConnEstabFailMmeOvlMos"], 0.0
+            rop_grp["pmS1SigConnEstabAtt"]
+            - rop_grp["pmS1SigConnEstabFailMmeOvlMos"]
+            - rop_grp["pmS1SigConnEstabFailMmeOvlMosCe"],
+            0.0,
         )
         s_sr = np.where(s_denom > 0, np.clip(rop_grp["pmS1SigConnEstabSucc"] / np.maximum(s_denom, 1.0), 0.0, 1.0), 1.0)
         e_sr = np.where(
@@ -2361,7 +2664,8 @@ def compute_rop_series(rop_trend_df: pd.DataFrame, cells: Optional[List[str]] = 
     req_cols = (
         "pmRrcConnEstabAtt", "pmRrcConnEstabAttReatt", "pmRrcConnEstabSucc",
         "pmRrcConnEstabFailMmeOvlMos", "pmRrcConnEstabFailMmeOvlMod",
-        "pmS1SigConnEstabAtt", "pmS1SigConnEstabSucc", "pmS1SigConnEstabFailMmeOvlMos",
+        "pmS1SigConnEstabAtt", "pmS1SigConnEstabSucc",
+        "pmS1SigConnEstabFailMmeOvlMos", "pmS1SigConnEstabFailMmeOvlMosCe",
         "pmErabEstabAttInit", "pmErabEstabSuccInit",
         "pmErabRelAbnormalEnb", "pmErabRelNormalEnb", "pmErabRelMme",
         "pmErabRelNormalEnbAct", "pmErabRelAbnormalEnbAct",
@@ -2381,7 +2685,12 @@ def compute_rop_series(rop_trend_df: pd.DataFrame, cells: Optional[List[str]] = 
         0.0,
     )
     r_sr = np.where(r_den > 0, np.clip(ts["pmRrcConnEstabSucc"] / np.maximum(r_den, 1.0), 0.0, 1.0), 1.0)
-    s_den = np.maximum(ts["pmS1SigConnEstabAtt"] - ts["pmS1SigConnEstabFailMmeOvlMos"], 0.0)
+    s_den = np.maximum(
+        ts["pmS1SigConnEstabAtt"]
+        - ts["pmS1SigConnEstabFailMmeOvlMos"]
+        - ts["pmS1SigConnEstabFailMmeOvlMosCe"],
+        0.0,
+    )
     s_sr = np.where(s_den > 0, np.clip(ts["pmS1SigConnEstabSucc"] / np.maximum(s_den, 1.0), 0.0, 1.0), 1.0)
     e_sr = np.where(
         ts["pmErabEstabAttInit"] > 0,

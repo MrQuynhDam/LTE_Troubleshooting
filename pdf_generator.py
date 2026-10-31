@@ -86,7 +86,12 @@ def build_html_report(
         if not valid_dcr_df.empty
         else float(full_df["DCR_eNB"].mean())
     )
-    avg_hosr = float(full_df["HOSR"].mean()) if not full_df.empty else 100.0
+    valid_ho_df = full_df[full_df["HO_Denom"] >= 20] if "HO_Denom" in full_df.columns else pd.DataFrame()
+    avg_hosr = (
+        float(valid_ho_df["HOSR"].mean())
+        if not valid_ho_df.empty
+        else (float(full_df["HOSR"].mean()) if not full_df.empty else 100.0)
+    )
     avg_cqi = float(full_df["Avg_CQI"].dropna().mean()) if full_df["Avg_CQI"].notna().any() else 0.0
 
     has_volte = bool(getattr(result, "has_volte_counters", False))
@@ -146,6 +151,19 @@ def build_html_report(
                 f'<td class="mono num">{vc_r:.2f}%</td>'
                 f'<td class="mono num {vd_cls}">{vd_r:.2f}%</td>'
             )
+        intra_txt = f"{r['Intra_HOSR']:.2f}%" if float(r.get("Intra_HO_Denom", 0)) > 0 else "—"
+        inter_txt = f"{r['Inter_HOSR']:.2f}%" if float(r.get("Inter_HO_Denom", 0)) > 0 else "—"
+        comb_txt = f"{r['HOSR']:.2f}%" if float(r.get("HO_Denom", 0)) > 0 else "—"
+        intra_cls = (
+            "txt-crit"
+            if float(r.get("Intra_HO_Denom", 0)) >= 20 and float(r.get("Intra_HOSR", 100.0)) < 92.0
+            else ("txt-deg" if float(r.get("Intra_HO_Denom", 0)) >= 20 and float(r.get("Intra_HOSR", 100.0)) < 96.0 else "")
+        )
+        inter_cls = (
+            "txt-crit"
+            if float(r.get("Inter_HO_Denom", 0)) >= 20 and float(r.get("Inter_HOSR", 100.0)) < 88.0
+            else ("txt-deg" if float(r.get("Inter_HO_Denom", 0)) >= 20 and float(r.get("Inter_HOSR", 100.0)) < 94.0 else "")
+        )
         matrix_rows.append(
             f"""
             <tr>
@@ -155,11 +173,14 @@ def build_html_report(
               <td class="mono num">{r['CSSR']:.2f}%</td>
               <td class="mono num {dcr_cls_cell}">{dcr_o:.2f}%</td>
               <td class="mono num">{dcr_e:.2f}%</td>
-              <td class="mono num">{r['HOSR']:.2f}%</td>
+              <td class="mono num {intra_cls}">{intra_txt}</td>
+              <td class="mono num {inter_cls}">{inter_txt}</td>
+              <td class="mono num">{comb_txt}</td>
               {volte_td_html}
               <td class="mono num">{cqi_txt}</td>
               <td class="mono num">{intf_txt}</td>
               <td>{html.escape(str(r['RCA_Category']))}</td>
+              <td class="mono">{html.escape(str(r.get('Isolated_Phase', 'N/A')))}</td>
               <td>{html.escape(str(r['Primary_Root_Cause']))}</td>
               <td class="mono num">{conf_txt}</td>
             </tr>
@@ -178,7 +199,7 @@ def build_html_report(
             f"<tr><td class='mono'>{html.escape(str(item['Counter / Indicator']))}</td>"
             f"<td class='mono fw-600'>{html.escape(str(item['Value']))}</td>"
             f"<td>{html.escape(str(item['Meaning']))}</td></tr>"
-            for item in ev_list[:12]
+            for item in ev_list[:14]
         )
         amos_escaped = html.escape(str(r.get("AMOS_Script", "")))
         deep_cards.append(
@@ -196,6 +217,7 @@ def build_html_report(
                 </div>
               </div>
               <div class="deep-meta">
+                <strong>Isolated Phase:</strong> <span class="mono">{html.escape(str(r.get('Isolated_Phase', 'N/A')))}</span> &bull;
                 <strong>Primary Root Cause:</strong> {html.escape(str(r['Primary_Root_Cause']))}<br/>
                 <strong>Action Recommendation:</strong> {html.escape(str(r['Recommendation']))}
               </div>
@@ -566,7 +588,7 @@ def build_html_report(
     <div class="kpi-card {'ok-border' if avg_cssr >= 98.5 else 'deg-border'}">
       <div class="kpi-label">System Accessibility (Avg CSSR)</div>
       <div class="kpi-val mono">{avg_cssr:.2f}%</div>
-      <div class="kpi-sub">Baseline 98.50% (<span class="{cssr_cls}">{cssr_delta:+.2f}%</span>) &bull; HOSR: {avg_hosr:.2f}%{volte_kpi_sub_cssr}</div>
+      <div class="kpi-sub">Baseline 98.50% (<span class="{cssr_cls}">{cssr_delta:+.2f}%</span>) &bull; Comb HOSR: {avg_hosr:.2f}%{volte_kpi_sub_cssr}</div>
     </div>
     <div class="kpi-card {'crit-border' if avg_dcr_ovr > 1.0 else 'ok-border'}">
       <div class="kpi-label">System Retainability (Overall DCR)</div>
@@ -584,19 +606,22 @@ def build_html_report(
   <table class="master-table">
     <thead>
       <tr>
-        <th style="width:68px;">Status</th>
-        <th style="width:98px;">eNodeB_Name</th>
-        <th style="width:112px;">EUtranCellFDD</th>
-        <th class="num" style="width:48px;">CSSR</th>
-        <th class="num" style="width:52px;">Ovr DCR</th>
-        <th class="num" style="width:52px;">eNB DCR</th>
-        <th class="num" style="width:48px;">HOSR</th>
+        <th style="width:62px;">Status</th>
+        <th style="width:88px;">eNodeB_Name</th>
+        <th style="width:102px;">EUtranCellFDD</th>
+        <th class="num" style="width:44px;">CSSR</th>
+        <th class="num" style="width:46px;">Ovr DCR</th>
+        <th class="num" style="width:46px;">eNB DCR</th>
+        <th class="num" style="width:48px;">Intra HO</th>
+        <th class="num" style="width:48px;">Inter HO</th>
+        <th class="num" style="width:48px;">Comb HO</th>
         {volte_th_html}
-        <th class="num" style="width:40px;">CQI</th>
-        <th class="num" style="width:52px;">UL dBm</th>
-        <th style="width:118px;">RCA Category</th>
+        <th class="num" style="width:36px;">CQI</th>
+        <th class="num" style="width:46px;">UL dBm</th>
+        <th style="width:96px;">RCA Category</th>
+        <th style="width:94px;">Isolated Phase</th>
         <th>Primary Root Cause Diagnosis</th>
-        <th class="num" style="width:42px;">Conf.</th>
+        <th class="num" style="width:38px;">Conf.</th>
       </tr>
     </thead>
     <tbody>
@@ -609,7 +634,7 @@ def build_html_report(
   {"".join(deep_cards)}
 
   <div class="footer-note mono">
-    Antigravity Principal RAN Performance &amp; Optimization Suite &bull; 3GPP / Ericsson MOM Deterministic RCA Engine v6.0
+    Antigravity Principal RAN Performance &amp; Optimization Suite &bull; 3GPP / Ericsson MOM Deterministic RCA Engine v8.0
   </div>
 
 </body>
@@ -775,17 +800,17 @@ def _render_via_reportlab(
 
     hdr_cols = [
         "Status", "eNodeB_Name", "EUtranCellFDD", "CSSR", "Ovr DCR",
-        "eNB DCR", "HOSR",
+        "Intra HO", "Inter HO", "Comb HO",
     ]
     if has_volte:
         hdr_cols.extend(["VoLTE SR", "VoLTE DCR"])
-    hdr_cols.extend(["CQI", "UL dBm", "RCA Category", "Primary Root Cause", "Conf"])
+    hdr_cols.extend(["CQI", "UL dBm", "RCA Category", "Phase", "Primary Root Cause", "Conf"])
     tbl_data = [hdr_cols]
     row_styles = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B0F19")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#F8FAFC")),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 7.0),
+        ("FONTSIZE", (0, 0), (-1, -1), 6.5),
         ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]
@@ -793,15 +818,18 @@ def _render_via_reportlab(
     for idx, (_, r) in enumerate(report_df.head(40).iterrows(), start=1):
         st_val = str(r["Status"])
         dcr_o = float(r.get("DCR_Overall", r.get("DCR", 0.0)))
-        dcr_e = float(r.get("DCR_eNB", 0.0))
+        intra_str = f"{r['Intra_HOSR']:.1f}%" if float(r.get("Intra_HO_Denom", 0)) > 0 else "—"
+        inter_str = f"{r['Inter_HOSR']:.1f}%" if float(r.get("Inter_HO_Denom", 0)) > 0 else "—"
+        comb_str = f"{r['HOSR']:.1f}%" if float(r.get("HO_Denom", 0)) > 0 else "—"
         row_vals = [
             st_val,
             str(r["eNodeB_Name"]),
             str(r["EUtranCellFDD"]),
             f"{r['CSSR']:.2f}%",
             f"{dcr_o:.2f}%",
-            f"{dcr_e:.2f}%",
-            f"{r['HOSR']:.2f}%",
+            intra_str,
+            inter_str,
+            comb_str,
         ]
         if has_volte:
             row_vals.extend([
@@ -812,6 +840,7 @@ def _render_via_reportlab(
             f"{r['Avg_CQI']:.1f}" if pd.notna(r.get("Avg_CQI")) else "N/A",
             f"{r['UL_Intf_dBm']:.1f}" if pd.notna(r.get("UL_Intf_dBm")) else "N/A",
             Paragraph(html.escape(str(r["RCA_Category"])), cell_txt),
+            Paragraph(html.escape(str(r.get("Isolated_Phase", "N/A"))), cell_txt),
             Paragraph(html.escape(str(r["Primary_Root_Cause"])), cell_txt),
             f"{int(r['Confidence_Score'])}%",
         ])
@@ -827,9 +856,17 @@ def _render_via_reportlab(
             row_styles.append(("TEXTCOLOR", (0, idx), (0, idx), colors.HexColor("#15803D")))
 
     if has_volte:
-        col_w = [16 * mm, 24 * mm, 27 * mm, 12 * mm, 12 * mm, 12 * mm, 12 * mm, 13 * mm, 13 * mm, 10 * mm, 13 * mm, 29 * mm, 69 * mm, 11 * mm]
+        col_w = [
+            15 * mm, 21 * mm, 24 * mm, 11 * mm, 11 * mm,
+            11 * mm, 11 * mm, 11 * mm, 11 * mm, 11 * mm,
+            9 * mm, 11 * mm, 23 * mm, 22 * mm, 61 * mm, 10 * mm,
+        ]
     else:
-        col_w = [17 * mm, 26 * mm, 30 * mm, 13 * mm, 13 * mm, 13 * mm, 13 * mm, 11 * mm, 14 * mm, 33 * mm, 78 * mm, 12 * mm]
+        col_w = [
+            16 * mm, 23 * mm, 26 * mm, 12 * mm, 12 * mm,
+            12 * mm, 12 * mm, 12 * mm, 10 * mm, 12 * mm,
+            26 * mm, 24 * mm, 65 * mm, 11 * mm,
+        ]
     m_tbl = Table(tbl_data, colWidths=col_w, repeatRows=1)
     m_tbl.setStyle(TableStyle(row_styles))
     story.append(m_tbl)

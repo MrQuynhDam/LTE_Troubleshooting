@@ -41,7 +41,7 @@ DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "Data" / "Counters.xlsx
 TRIAGE_PRESETS = [
     "All Degraded",
     "Drop Call Spike (DCR > 1%)",
-    "Handover / RACH Issue (HOSR < 95%)",
+    "Handover / RACH Issue (Intra/Inter HOSR)",
     "Accessibility Failure (CSSR < 97%)",
     "IRAT Ping-Pong Loop (> 5%)",
     "Radio Quality / CQI Degraded",
@@ -370,6 +370,12 @@ def inject_cockpit_css() -> None:
         }
         .mini-kpi-grid.cols-4 {
             grid-template-columns: repeat(4, 1fr);
+        }
+        .mini-kpi-grid.cols-5 {
+            grid-template-columns: repeat(5, 1fr);
+        }
+        .mini-kpi-grid.cols-5 .mk-val {
+            font-size: 0.78rem;
         }
         .mini-kpi {
             background: #0B0F19;
@@ -837,7 +843,9 @@ def build_pareto_worst_chart(
         "Overall DCR (%)": ("DCR_Overall", "DCR_Denom", 30, "%", True),
         "eNB DCR (%)": ("DCR_eNB", "DCR_Denom", 30, "%", True),
         "Drops / Session Hr": ("DCR_Norm", "pmSessionTimeUe", 3600, "/hr", True),
-        "Lowest HOSR (%)": ("HOSR", "HO_Denom", 20, "%", False),
+        "Lowest Intra-Freq HOSR (%)": ("Intra_HOSR", "Intra_HO_Denom", 20, "%", False),
+        "Lowest Inter-Freq HOSR (%)": ("Inter_HOSR", "Inter_HO_Denom", 20, "%", False),
+        "Lowest Combined HOSR (%)": ("HOSR", "HO_Denom", 20, "%", False),
         "Low CQI (<7) Ratio (%)": ("Low_CQI_Ratio", "CQI_Samples", 100, "%", True),
         "RACH OOC Ratio (%)": ("RACH_OOC_Ratio", "pmRaAttCbra", 100, "%", True),
         "IRAT Ping-Pong (%)": ("IRAT_PingPong_Rate", "IRAT_Denom", 10, "%", True),
@@ -962,9 +970,11 @@ def apply_filters(cell_df: pd.DataFrame) -> pd.DataFrame:
             (df["DCR_Denom"] >= 30)
             & ((df["DCR_Overall"] > 1.0) | ((df["pmSessionTimeUe"] >= 3600) & (df["DCR_Norm"] > 10.0)))
         ]
-    elif preset == "Handover / RACH Issue (HOSR < 95%)":
+    elif preset in ("Handover / RACH Issue (Intra/Inter HOSR)", "Handover / RACH Issue (HOSR < 95%)"):
         df = df[
-            ((df["HO_Denom"] >= 20) & (df["HOSR"] < 95.0))
+            ((df["Intra_HO_Denom"] >= 20) & (df["Intra_HOSR"] < 96.0))
+            | ((df["Inter_HO_Denom"] >= 20) & (df["Inter_HOSR"] < 94.0))
+            | ((df["HO_Denom"] >= 20) & (df["HOSR"] < 95.0))
             | ((df["CSSR_Denom"] >= 30) & (df["RACH_OOC_Ratio"] > 5.0))
         ]
     elif preset == "Accessibility Failure (CSSR < 97%)":
@@ -1026,7 +1036,7 @@ def main() -> None:
               <div style="width:34px;height:34px;border-radius:8px;background:#151D2E;border:1px solid #38BDF8;display:flex;align-items:center;justify-content:center;font-weight:700;color:#38BDF8;font-family:'JetBrains Mono',monospace;">E///</div>
               <div>
                 <div style="font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:0.98rem;color:#F8FAFC;">RAN RCA COCKPIT</div>
-                <div style="font-size:0.70rem;color:#94A3B8;font-family:'JetBrains Mono',monospace;">ENM / AMOS Telemetry v6.0</div>
+                <div style="font-size:0.70rem;color:#94A3B8;font-family:'JetBrains Mono',monospace;">ENM / AMOS Telemetry v8.0</div>
               </div>
             </div>
             """
@@ -1243,6 +1253,13 @@ def main() -> None:
         else float(full_df["VoLTE_DCR"].mean())
     )
 
+    valid_ho_cells = full_df[full_df["HO_Denom"] >= 20]
+    avg_hosr = (
+        float(valid_ho_cells["HOSR"].mean())
+        if not valid_ho_cells.empty
+        else float(full_df["HOSR"].mean())
+    )
+
     c1, c2, c3, c4 = st.columns(4, gap="small")
 
     with c1:
@@ -1303,7 +1320,7 @@ def main() -> None:
               </div>
               <div class="kpi-foot">
                 {c3_foot_left}
-                <span class="mono-num">HOSR: {full_df['HOSR'].mean():.2f}%</span>
+                <span class="mono-num">Comb HOSR: {avg_hosr:.2f}%</span>
               </div>
             </div>
             """
@@ -1415,7 +1432,9 @@ def main() -> None:
                 "Overall DCR (%)",
                 "eNB DCR (%)",
                 "Drops / Session Hr",
-                "Lowest HOSR (%)",
+                "Lowest Intra-Freq HOSR (%)",
+                "Lowest Inter-Freq HOSR (%)",
+                "Lowest Combined HOSR (%)",
                 "Low CQI (<7) Ratio (%)",
                 "RACH OOC Ratio (%)",
                 "Lowest CSSR (%)",
@@ -1562,7 +1581,9 @@ def main() -> None:
             "CSSR (%)": grid_df["CSSR"].round(2),
             "Overall DCR (%)": grid_df["DCR_Overall"].round(2),
             "eNB DCR (%)": grid_df["DCR_eNB"].round(2),
-            "HOSR (%)": grid_df["HOSR"].round(2),
+            "Intra HOSR (%)": np.where(grid_df["Intra_HO_Denom"] > 0, grid_df["Intra_HOSR"].round(2), np.nan),
+            "Inter HOSR (%)": np.where(grid_df["Inter_HO_Denom"] > 0, grid_df["Inter_HOSR"].round(2), np.nan),
+            "Comb HOSR (%)": np.where(grid_df["HO_Denom"] > 0, grid_df["HOSR"].round(2), np.nan),
             "Avg CQI": grid_df["Avg_CQI"].round(2),
             "UL Intf (dBm)": grid_df["UL_Intf_dBm"].round(1),
             "IRAT PP (%)": grid_df["IRAT_PingPong_Rate"].round(2),
@@ -1571,6 +1592,7 @@ def main() -> None:
             grid_cols_data["VoLTE CSSR (%)"] = grid_df["VoLTE_CSSR"].round(2)
             grid_cols_data["VoLTE DCR (%)"] = grid_df["VoLTE_DCR"].round(2)
         grid_cols_data["RCA Type"] = grid_df["RCA_Category"]
+        grid_cols_data["Phase"] = grid_df["Isolated_Phase"]
         grid_cols_data["Root Cause Diagnosis"] = grid_df["Primary_Root_Cause"]
         grid_cols_data["Confidence"] = grid_df["Confidence_Score"]
         display_df = pd.DataFrame(grid_cols_data)
@@ -1591,13 +1613,16 @@ def main() -> None:
                 "CSSR (%)": st.column_config.NumberColumn("CSSR %", format="%.2f%%"),
                 "Overall DCR (%)": st.column_config.NumberColumn("Overall DCR %", format="%.2f%%"),
                 "eNB DCR (%)": st.column_config.NumberColumn("eNB DCR %", format="%.2f%%"),
-                "HOSR (%)": st.column_config.NumberColumn("HOSR %", format="%.2f%%"),
+                "Intra HOSR (%)": st.column_config.NumberColumn("Intra HOSR %", format="%.2f%%"),
+                "Inter HOSR (%)": st.column_config.NumberColumn("Inter HOSR %", format="%.2f%%"),
+                "Comb HOSR (%)": st.column_config.NumberColumn("Comb HOSR %", format="%.2f%%"),
                 "Avg CQI": st.column_config.NumberColumn("Avg CQI", format="%.2f"),
                 "UL Intf (dBm)": st.column_config.NumberColumn("UL Noise", format="%.1f dBm"),
                 "IRAT PP (%)": st.column_config.NumberColumn("IRAT PP", format="%.2f%%"),
                 "VoLTE CSSR (%)": st.column_config.NumberColumn("VoLTE CSSR", format="%.2f%%"),
                 "VoLTE DCR (%)": st.column_config.NumberColumn("VoLTE DCR", format="%.2f%%"),
                 "RCA Type": st.column_config.TextColumn("RCA Category", width="medium"),
+                "Phase": st.column_config.TextColumn("Isolated Phase", width="medium"),
                 "Root Cause Diagnosis": st.column_config.TextColumn("Primary Root Cause", width="large"),
                 "Confidence": st.column_config.ProgressColumn(
                     "Confidence",
@@ -1671,7 +1696,25 @@ def main() -> None:
             amos_text = str(cell_row["AMOS_Script"])
             amos_lines_html = format_amos_terminal_html(amos_text)
 
-            mini_grid_cls = "mini-kpi-grid cols-4" if result.has_volte_counters else "mini-kpi-grid"
+            mini_grid_cls = "mini-kpi-grid cols-5" if result.has_volte_counters else "mini-kpi-grid cols-4"
+            intra_str = f"{cell_row['Intra_HOSR']:.2f}%" if cell_row["Intra_HO_Denom"] > 0 else "N/A"
+            inter_str = f"{cell_row['Inter_HOSR']:.2f}%" if cell_row["Inter_HO_Denom"] > 0 else "N/A"
+            comb_str = f"{cell_row['HOSR']:.2f}%" if cell_row["HO_Denom"] > 0 else "N/A"
+            intra_col = (
+                "#FF4D4F"
+                if cell_row["Intra_HO_Denom"] >= 20 and cell_row["Intra_HOSR"] < 92.0
+                else ("#FAAD14" if cell_row["Intra_HO_Denom"] >= 20 and cell_row["Intra_HOSR"] < 96.0 else "#F8FAFC")
+            )
+            inter_col = (
+                "#FF4D4F"
+                if cell_row["Inter_HO_Denom"] >= 20 and cell_row["Inter_HOSR"] < 88.0
+                else ("#FAAD14" if cell_row["Inter_HO_Denom"] >= 20 and cell_row["Inter_HOSR"] < 94.0 else "#F8FAFC")
+            )
+            comb_col = (
+                "#FF4D4F"
+                if cell_row["HO_Denom"] >= 20 and cell_row["HOSR"] < 90.0
+                else ("#FAAD14" if cell_row["HO_Denom"] >= 20 and cell_row["HOSR"] < 95.0 else "#F8FAFC")
+            )
             volte_mini_html = ""
             if result.has_volte_counters:
                 vc_val = float(cell_row["VoLTE_CSSR"])
@@ -1695,7 +1738,7 @@ def main() -> None:
                   <div class="drawer-top">
                     <div>
                       <div class="drawer-cell-id">{html.escape(str(cell_row['EUtranCellFDD']))}</div>
-                      <div class="drawer-enb-id">eNodeB: {html.escape(str(cell_row['eNodeB_Name']))} &bull; {html.escape(str(cell_row['RCA_Category']))}</div>
+                      <div class="drawer-enb-id">eNodeB: {html.escape(str(cell_row['eNodeB_Name']))} &bull; {html.escape(str(cell_row['RCA_Category']))} &bull; Phase: {html.escape(str(cell_row['Isolated_Phase']))}</div>
                     </div>
                     <div style="text-align:right;">
                       {status_badge_html(st_val)}
@@ -1718,8 +1761,16 @@ def main() -> None:
                       <div class="mk-val" style="color:{'#FF4D4F' if cell_row['DCR_eNB']>2.5 else ('#FAAD14' if cell_row['DCR_eNB']>1.0 else '#52C41A')};">{cell_row['DCR_eNB']:.2f}%</div>
                     </div>
                     <div class="mini-kpi">
-                      <div class="mk-lbl">HOSR</div>
-                      <div class="mk-val" style="color:{'#FF4D4F' if cell_row['HOSR']<90 else ('#FAAD14' if cell_row['HOSR']<95 else '#F8FAFC')};">{cell_row['HOSR']:.2f}%</div>
+                      <div class="mk-lbl">Intra HOSR</div>
+                      <div class="mk-val" style="color:{intra_col};">{intra_str}</div>
+                    </div>
+                    <div class="mini-kpi">
+                      <div class="mk-lbl">Inter HOSR</div>
+                      <div class="mk-val" style="color:{inter_col};">{inter_str}</div>
+                    </div>
+                    <div class="mini-kpi">
+                      <div class="mk-lbl">Comb HOSR</div>
+                      <div class="mk-val" style="color:{comb_col};">{comb_str}</div>
                     </div>
                     <div class="mini-kpi">
                       <div class="mk-lbl">Avg CQI</div>
