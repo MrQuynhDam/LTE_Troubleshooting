@@ -1,14 +1,14 @@
 """
-Ericsson LTE RAN Performance Troubleshooting & Root-Cause Prediction Engine (v8.0.0).
+Ericsson LTE RAN Performance Troubleshooting & Root-Cause Prediction Engine (v8.4.0).
 
 Implements ETL ingestion (CSV / multi-sheet Excel with metadata headers),
 exact 3GPP/Ericsson MOM composite KPI calculations (CSSR, 3GPP Overall DCR,
 eNB DCR, Session-Normalized Drop Rate, Intra-Freq HOSR, Inter-Freq HOSR,
-Combined LTE HOSR, CQI/HomCQI/MIMO/PRB Interference, 3G/4G IRAT Ping-Pong,
-and VoLTE QCI=1/QCI=5 KPIs), statistical sample-size validation (Rule of
-Minimum Denominator), deterministic multi-domain RCA decision trees with explicit
-Handover Phase separation (Preparation Phase vs Execution Phase, Trees 4.1 - 4.7),
-and automated AMOS/Moshell CLI remediation scripts.
+Combined LTE HOSR, Unified CQI [Table 1 + 256-QAM Table 2], MIMO Rank-1,
+PRB Interference, 3G/4G IRAT Ping-Pong, and VoLTE QCI=1/QCI=5 + SRVCC KPIs),
+statistical sample-size validation (Rule of Minimum Denominator), deterministic
+multi-domain RCA decision trees with explicit Phase separation (Trees 4.1 - 4.7),
+2-Step Operational Safety Gate, and automated AMOS/Moshell CLI remediation scripts.
 """
 
 from __future__ import annotations
@@ -132,6 +132,8 @@ COLUMN_ALIASES: Dict[str, str] = {
 SCALAR_COUNTERS: List[str] = [
     # 2.1 & 3.1 RACH & RRC Accessibility
     "pmRaAttCbra",
+    "pmRaMsg2AttCbra",
+    "pmRaSuccCbra",
     "pmRaFailCbraMsg1DiscOoc",
     "pmRaFailCbraMsg1DiscSched",
     "pmRaFailCbraMsg2Disc",
@@ -158,6 +160,7 @@ SCALAR_COUNTERS: List[str] = [
     "pmErabRelAbnormalEnb",
     "pmErabRelNormalEnb",
     "pmErabRelMme",
+    "pmErabRelMmeActEutra",
     "pmErabRelNormalEnbAct",
     "pmErabRelAbnormalEnbAct",
     "pmErabRelAbnormalMmeAct",
@@ -176,6 +179,11 @@ SCALAR_COUNTERS: List[str] = [
     "pmCellHoPrepSuccLteInterF",
     "pmCellHoExeAttLteInterF",
     "pmCellHoExeSuccLteInterF",
+    "EUtranFreqRelation.pmHoPrepAtt",
+    "EUtranFreqRelation.pmHoPrepSucc",
+    "EUtranFreqRelation.pmHoExeAtt",
+    "EUtranFreqRelation.pmHoExeSucc",
+    "pmHoPrepRejInMeasGap",
     "pmHoPrepAtt",
     "pmHoPrepSucc",
     "pmHoExeAtt",
@@ -201,7 +209,9 @@ SCALAR_COUNTERS: List[str] = [
     "b2Threshold2EcNoUtran",
     "timeToTriggerB2",
     "hysteresisB2",
-    # 2.6, 2.7 & 3.6 VoLTE QCI=1 (23.Q3+ Added Bearers & Legacy Fallbacks) + QCI=5
+    "measGapPattern",
+    "dl256QamEnabled",
+    # 2.6, 2.7 & 3.6 VoLTE QCI=1 (23.Q3+/25.Q3 Added Bearers & Legacy Fallbacks) + QCI=5 + RLC ARQ
     "pmErabEstabAttAddedQci[1]",
     "pmErabEstabSuccAddedQci[1]",
     "pmErabEstabAttAddedHoOngoingQci[1]",
@@ -224,6 +234,9 @@ SCALAR_COUNTERS: List[str] = [
     "pmRlcPduRetransUlQci[1]",
     "pmRlcPduTxUlQci[1]",
     "pmRlcPduRetransDlQci[1]",
+    "pmRlcArqRetxDl",
+    "pmRlcArqUlNack",
+    "pmRlcPollRetxUl",
     "pmHoPrepAttSrvcc",
     "pmHoExeSuccSrvcc",
 ]
@@ -235,12 +248,20 @@ PARAMETER_COLS = (
     "b2Threshold2EcNoUtran",
     "timeToTriggerB2",
     "hysteresisB2",
+    "measGapPattern",
+    "dl256QamEnabled",
 )
 
 COUNTER_LOWER_MAP: Dict[str, str] = {c.lower(): c for c in SCALAR_COUNTERS}
 COUNTER_LOWER_MAP.update(
     {
         # Legacy / variant OSS exports
+        "eutranfreqrelation_pmhoprepatt": "EUtranFreqRelation.pmHoPrepAtt",
+        "eutranfreqrelation_pmhoprepsucc": "EUtranFreqRelation.pmHoPrepSucc",
+        "eutranfreqrelation_pmhoexeatt": "EUtranFreqRelation.pmHoExeAtt",
+        "eutranfreqrelation_pmhoexesucc": "EUtranFreqRelation.pmHoExeSucc",
+        "uemeascontrol.measgappattern": "measGapPattern",
+        "uemeascontrol_measgappattern": "measGapPattern",
         "utrancellrelation_pmhoprepatt": "UtranCellRelation.pmHoPrepAtt",
         "utrancellrelation_pmhoprepsucc": "UtranCellRelation.pmHoPrepSucc",
         "utrancellrelation_pmhoexeatt": "UtranCellRelation.pmHoExeAtt",
@@ -510,10 +531,12 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
     """
     Vectorized transformation of long-format CqiDistr sheet (Vector_Index 0..15)
     into:
-      1) Per-Cell aggregated CQI bins [0..15], 256-QAM HomCQI, MIMO Rank 1 ratio, and UL Interference (dBm)
-      2) Per-ROP_Time Network CQI trendline metrics
+      1) Per-Cell Unified CQI bins [0..15] (Standard Table 1 + 256-QAM Table 2 per v8.4.0 Section 2.6),
+         256-QAM HomCQI samples/ratio, MIMO Rank 1 ratio, and UL Interference (dBm)
+      2) Per-ROP_Time Network Unified CQI trendline metrics
     """
     df = df_cqi.copy()
+    has_hom_col = "pmRadioHomUeRepCqiDistr" in df.columns
     df["ROP_Time"] = _build_rop_timestamp(df)
     if "eNodeB_Name" not in df.columns and "EUtranCellFDD" in df.columns:
         df["eNodeB_Name"] = df["EUtranCellFDD"].astype(str).str.slice(0, 14)
@@ -533,8 +556,8 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         else:
             df[col] = 0.0
 
-    # --- A. Cell-level CQI Bins (0..15), 256-QAM HomCQI, Rank 1..4, and Interference PDF ---
-    cqi_cell_piv = (
+    # --- A. Cell-level Unified CQI Bins (0..15): Table 1 + 256-QAM Table 2 ---
+    cqi_t1_piv = (
         df.pivot_table(
             index="EUtranCellFDD",
             columns="Vector_Index",
@@ -543,13 +566,6 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
             fill_value=0.0,
         )
         .reindex(columns=range(16), fill_value=0.0)
-    )
-
-    cqi_tot = cqi_cell_piv.sum(axis=1)
-    cqi_weighted = cqi_cell_piv.values @ np.arange(16, dtype=np.float64)
-    avg_cqi = np.where(cqi_tot > 0, cqi_weighted / np.maximum(cqi_tot, 1.0), np.nan)
-    low_cqi_pct = np.where(
-        cqi_tot > 0, cqi_cell_piv[list(range(7))].sum(axis=1) / np.maximum(cqi_tot, 1.0) * 100.0, 0.0
     )
 
     # 256-QAM High-Order Modulation CQI array (pmRadioHomUeRepCqiDistr[0..15])
@@ -563,12 +579,24 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         )
         .reindex(columns=range(16), fill_value=0.0)
     )
-    hom_tot = hom_cell_piv.reindex(cqi_cell_piv.index).fillna(0.0).sum(axis=1)
+
+    # Unified CQI Distribution per SKILL.md v8.4.0 Section 2.6: C_i = Table1[i] + Table2[i]
+    cqi_cell_piv = cqi_t1_piv.add(hom_cell_piv, fill_value=0.0).reindex(
+        columns=range(16), fill_value=0.0
+    )
+
+    cqi_tot = cqi_cell_piv.sum(axis=1)
+    cqi_weighted = cqi_cell_piv.values @ np.arange(16, dtype=np.float64)
+    avg_cqi = np.where(cqi_tot > 0, cqi_weighted / np.maximum(cqi_tot, 1.0), np.nan)
+    low_cqi_pct = np.where(
+        cqi_tot > 0, cqi_cell_piv[list(range(7))].sum(axis=1) / np.maximum(cqi_tot, 1.0) * 100.0, 0.0
+    )
+
+    hom_aligned = hom_cell_piv.reindex(cqi_cell_piv.index).fillna(0.0)
+    hom_tot = hom_aligned.sum(axis=1)
     hom_high_pct = np.where(
         hom_tot > 0,
-        hom_cell_piv.reindex(cqi_cell_piv.index).fillna(0.0)[list(range(12, 16))].sum(axis=1)
-        / np.maximum(hom_tot, 1.0)
-        * 100.0,
+        hom_aligned[list(range(12, 16))].sum(axis=1) / np.maximum(hom_tot, 1.0) * 100.0,
         np.nan,
     )
 
@@ -583,8 +611,9 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         )
         .reindex(columns=range(4), fill_value=0.0)
     )
-    rank_tot = rank_cell_piv.sum(axis=1)
-    rank1_pct = np.where(rank_tot > 0, rank_cell_piv[0] / np.maximum(rank_tot, 1.0) * 100.0, np.nan)
+    rank_aligned = rank_cell_piv.reindex(cqi_cell_piv.index).fillna(0.0)
+    rank_tot = rank_aligned.sum(axis=1)
+    rank1_pct = np.where(rank_tot > 0, rank_aligned[0] / np.maximum(rank_tot, 1.0) * 100.0, np.nan)
 
     # UL Interference Power (dBm/PRB) from 16-bin PDF
     intf_cell_piv = (
@@ -597,10 +626,11 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         )
         .reindex(columns=range(16), fill_value=0.0)
     )
-    intf_tot = intf_cell_piv.sum(axis=1)
+    intf_aligned = intf_cell_piv.reindex(cqi_cell_piv.index).fillna(0.0)
+    intf_tot = intf_aligned.sum(axis=1)
     intf_mw = np.where(
         intf_tot > 0,
-        (intf_cell_piv.values @ INTF_PDF_MIDPOINTS_MW) / np.maximum(intf_tot, 1.0),
+        (intf_aligned.values @ INTF_PDF_MIDPOINTS_MW) / np.maximum(intf_tot, 1.0),
         np.nan,
     )
     ul_intf_dbm = np.where(
@@ -612,6 +642,7 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
     cell_radio_data: Dict[str, Any] = {
         "EUtranCellFDD": cqi_cell_piv.index,
         "CQI_Samples": cqi_tot.values,
+        "Hom_CQI_Samples": hom_tot.values if has_hom_col else np.full(len(cqi_cell_piv), np.nan),
         "Avg_CQI": avg_cqi,
         "Low_CQI_Ratio": low_cqi_pct,
         "Hom_256QAM_Ratio": hom_high_pct,
@@ -623,8 +654,8 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         cell_radio_data[f"CQI_Bin_{b}"] = cqi_cell_piv[b].values
     cell_radio_df = pd.DataFrame(cell_radio_data)
 
-    # --- B. ROP-level Network CQI for Trendlines ---
-    rop_cqi_piv = (
+    # --- B. ROP-level Network Unified CQI for Trendlines ---
+    rop_t1_piv = (
         df.pivot_table(
             index="ROP_Time",
             columns="Vector_Index",
@@ -633,6 +664,19 @@ def _process_cqi_long_sheet(df_cqi: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
             fill_value=0.0,
         )
         .reindex(columns=range(16), fill_value=0.0)
+    )
+    rop_hom_piv = (
+        df.pivot_table(
+            index="ROP_Time",
+            columns="Vector_Index",
+            values="pmRadioHomUeRepCqiDistr",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        .reindex(columns=range(16), fill_value=0.0)
+    )
+    rop_cqi_piv = rop_t1_piv.add(rop_hom_piv, fill_value=0.0).reindex(
+        columns=range(16), fill_value=0.0
     )
     rop_tot = rop_cqi_piv.sum(axis=1)
     rop_avg_cqi = np.where(
@@ -1195,6 +1239,12 @@ def _diagnose_cell_row(
         if intra_exe_fail:
             e_boost = 2 if (intra_prep_fail and not prep_dom) else 0
             intra_ho_drop_ratio = (abn_ho / intra_exe_denom) if intra_exe_denom > 0 else 0.0
+            rlc_poll_ul = float(row.get("pmRlcPollRetxUl", 0.0))
+            rlc_ul_nack = float(row.get("pmRlcArqUlNack", 0.0))
+            high_rlc_retx = (
+                (dcr_denom > 0 and (rlc_poll_ul / dcr_denom) > 5.0)
+                or (rlc_ul_nack >= 500.0 and (rlc_poll_ul / rlc_ul_nack) > 0.85)
+            )
             if intra_ho_drop_ratio > 0.05 and (avg_cqi < 8.5 or low_cqi > 25.0):
                 findings.append({
                     "severity": sev,
@@ -1206,7 +1256,7 @@ def _diagnose_cell_row(
                     "recommendation": "Lower a3Offset (e.g., from 30 [3.0dB] to 15 [1.5dB]) and reduce timeToTrigger (e.g., from 100ms to 40ms).",
                     "scenario": "C1_INTRA_HO",
                 })
-            elif ul_intf > -110.0 or abn_oos > 5.0:
+            elif ul_intf > -110.0 or abn_oos > 5.0 or high_rlc_retx:
                 findings.append({
                     "severity": sev,
                     "domain": "Intra-Freq HOSR",
@@ -1241,13 +1291,16 @@ def _diagnose_cell_row(
                 })
 
     # ------------------------------------------------------------------
-    # TREE 4.4: INTER-FREQUENCY HANDOVER RCA (Prep Phase vs Exe Phase, v8.0.0)
+    # TREE 4.4: INTER-FREQUENCY HANDOVER RCA (Prep Phase vs Exe Phase, v8.4.0)
     # ------------------------------------------------------------------
     rrc_succ = float(row.get("pmRrcConnEstabSucc", 0.0))
     bad_cov_rep = max(
         float(row.get("pmBadCovEvalReport", 0.0)),
         float(row.get("pmBadCovSearchEvalReport", 0.0)),
     )
+    meas_gap_rej = float(row.get("pmHoPrepRejInMeasGap", 0.0))
+    meas_gap_cfg = float(row["measGapPattern"]) if pd.notna(row.get("measGapPattern")) else np.nan
+    meas_gap_fail = meas_gap_rej > 0 or (pd.notna(meas_gap_cfg) and meas_gap_cfg < 0)
 
     if valid_inter_ho and inter_hosr < 94.0:
         ho_tree_triggered = True
@@ -1268,6 +1321,17 @@ def _diagnose_cell_row(
                     "confidence": min(98, 96 + ip_boost),
                     "recommendation": "Upgrade Connected Users License on target frequency eNodeB.",
                     "scenario": "B_LIC",
+                })
+            elif meas_gap_fail:
+                findings.append({
+                    "severity": sev,
+                    "domain": "Inter-Freq HOSR",
+                    "phase": "Preparation Phase",
+                    "category": "Event B2/A2 & Mobility Tuning",
+                    "cause": f"Inter-Freq Prep Failure - Measurement Gap Configuration Allocation Failure (Prep {inter_prep_sr:.2f}%)",
+                    "confidence": min(98, 95 + ip_boost),
+                    "recommendation": "Check UeMeasControl.measGapPattern configuration and audit triggerQuantity (RSRP vs RSRQ).",
+                    "scenario": "C2_INTER_HO",
                 })
             elif gbr_fail_all > 0 or ho_ul_rej > 0:
                 findings.append({
@@ -1356,8 +1420,11 @@ def _diagnose_cell_row(
             })
 
     # ------------------------------------------------------------------
-    # TREE 4.5: LOW CQI / RADIO INTERFERENCE DEGRADATION (v8.0.0)
+    # TREE 4.5: LOW CQI / RADIO INTERFERENCE DEGRADATION (v8.4.0)
     # ------------------------------------------------------------------
+    dl_256qam_cfg = float(row["dl256QamEnabled"]) if pd.notna(row.get("dl256QamEnabled")) else np.nan
+    hom_cqi_samples = float(row["Hom_CQI_Samples"]) if pd.notna(row.get("Hom_CQI_Samples")) else np.nan
+
     if valid_cqi and (avg_cqi < 7.5 or low_cqi > 30.0 or ul_intf > -110.0):
         sev = 3 if (avg_cqi < 6.0 or low_cqi > 50.0 or ul_intf > -105.0) else 2
         if ul_intf > -108.0:
@@ -1404,6 +1471,17 @@ def _diagnose_cell_row(
                 "confidence": 89,
                 "recommendation": "Shift EARFCN frequency, enable Adaptive Frequency Selective Scheduling (FSS).",
                 "scenario": "A_PIM",
+            })
+        elif pd.notna(dl_256qam_cfg) and dl_256qam_cfg >= 1.0 and (pd.isna(hom_cqi_samples) or hom_cqi_samples == 0.0):
+            findings.append({
+                "severity": sev,
+                "domain": "CQI / RF",
+                "phase": "DL Radio / SINR",
+                "category": "RF Weak Coverage / UL Power",
+                "cause": "Low 256-QAM Device Penetration or Suboptimal CQI Reporting Table Configuration",
+                "confidence": 89,
+                "recommendation": "Verify UE capabilities distribution and ensure cqiTable is configured to support high-order modulations.",
+                "scenario": "A_COV_RET",
             })
         else:
             findings.append({
@@ -1669,11 +1747,23 @@ def _diagnose_cell_row(
             "Meaning": "PIM / Narrowband Spectral Imbalance",
         },
         {
-            "Counter / Indicator": "CQI & MIMO Rank-1 Profile",
+            "Counter / Indicator": "Unified CQI & MIMO Rank-1",
             "Value": f"CQI {avg_cqi:.2f} | Low {low_cqi:.1f}% | R1 {rank1_pct:.1f}%",
-            "Meaning": "DL Radio SINR & Spatial Multiplexing Rank",
+            "Meaning": "Unified DL SINR (T1 + 256QAM T2) & Spatial Rank",
         },
     ]
+
+    rlc_dl_retx = int(row.get("pmRlcArqRetxDl", 0))
+    rlc_ul_nack_ev = int(row.get("pmRlcArqUlNack", 0))
+    rlc_ul_poll_ev = int(row.get("pmRlcPollRetxUl", 0))
+    if (rlc_dl_retx + rlc_ul_nack_ev + rlc_ul_poll_ev) > 0:
+        evidence_items.append(
+            {
+                "Counter / Indicator": "RLC ARQ Retransmissions",
+                "Value": f"DL:{rlc_dl_retx:,} | UL Poll:{rlc_ul_poll_ev:,}",
+                "Meaning": f"UL NACK: {rlc_ul_nack_ev:,} | Radio Link ARQ Stability",
+            }
+        )
 
     if has_irat:
         ir_sc = int(row.get("pmUeCtxtRelSCWcdma", 0))
@@ -1698,11 +1788,18 @@ def _diagnose_cell_row(
         v_abn_e = int(row.get("pmErabRelAbnormalEnbActQci[1]", 0))
         v_abn_m = int(row.get("pmErabRelAbnormalMmeActQci[1]", 0))
         v_sess_s = int(row.get("pmSessionTimeDrbQci[1]", 0))
+        srvcc_a = int(row.get("pmHoPrepAttSrvcc", 0))
+        srvcc_s = int(row.get("pmHoExeSuccSrvcc", 0))
+        srvcc_txt = (
+            f" | SRVCC: {srvcc_s}/{srvcc_a} ({srvcc_s / srvcc_a * 100.0:.1f}%)"
+            if srvcc_a > 0
+            else ""
+        )
         evidence_items.append(
             {
                 "Counter / Indicator": "VoLTE QCI=1 Bearer KPI",
                 "Value": f"CSSR {volte_cssr:.2f}% (QCI1 {volte_bearer_sr:.2f}%) | DCR {volte_dcr:.2f}%",
-                "Meaning": f"Att: {int(volte_cssr_denom):,} | Drops: {v_abn_e + v_abn_m} (eNB:{v_abn_e}, MME:{v_abn_m}) / {int(volte_dcr_denom):,} rel | {v_sess_s:,}s",
+                "Meaning": f"Att: {int(volte_cssr_denom):,} | Drops: {v_abn_e + v_abn_m} (eNB:{v_abn_e}, MME:{v_abn_m}) / {int(volte_dcr_denom):,} rel | {v_sess_s:,}s{srvcc_txt}",
             }
         )
 
@@ -1767,20 +1864,23 @@ def _diagnose_cell_row(
 def generate_amos_script(
     enodeb: str, cell: str, scenarios: List[str], root_cause: str
 ) -> str:
-    """Build copy-pasteable Ericsson AMOS / Moshell CLI script per Section 5.1 - 5.5."""
+    """Build copy-pasteable Ericsson AMOS / Moshell CLI script per SKILL.md v8.4.0 Sections 5.1 - 5.8."""
     lines = [
         "# ===================================================================",
-        "# ERICSSON AMOS / MOSHELL REMEDIATION PROTOCOL (v8.0)",
+        "# ERICSSON AMOS / MOSHELL REMEDIATION PROTOCOL (v8.4 • 25.Q3)",
         f"# Target Node : {enodeb}   |   Cell : {cell}",
         f"# Diagnosis   : {root_cause}",
         "# ===================================================================",
         f"moshell {enodeb}",
         "lt all",
+        "",
+        "# --- STEP 1: PRE-EXECUTION SAFETY GATE & BASELINE CV BACKUP ---",
         "confb+",
         "gs+",
-        "",
-        "# --- Step 1: Health, Alarm & Operational State Verification ---",
+        "cvls",
+        'cvms Pre_Opt_Baseline "Baseline CV prior to optimization script execution"',
         f"st EUtranCellFDD={cell}",
+        "st SectorCarrier",
         "alt",
     ]
 
@@ -1788,23 +1888,28 @@ def generate_amos_script(
         if sc == "A_PIM":
             lines.extend([
                 "",
-                "# --- Scenario A: Low CQI / UL Interference & PIM Diagnostic Protocol ---",
+                "# --- Scenario A: Bad CQI / UL Interference & PIM Protocol ---",
                 f"pget EUtranCellFDD={cell} pmRadioRecInterferencePwr$",
                 f"pget EUtranCellFDD={cell} pmRadioRecInterferencePwrPrb",
-                f"pget EUtranCellFDD={cell} pmRadioUeRepCqiDistr|pmRadioUeRepRankDistr",
+                f"pget EUtranCellFDD={cell} pmRadioUeRepCqiDistr|pmRadioHomUeRepCqiDistr|pmRadioUeRepRankDistr",
+                f"get EUtranCellFDD={cell} dl256QamEnabled",
                 "cabx",
                 "lhsh BXP_0 vsi",
+                "set QciProfilePredefined=1 dlResourceAllocationStrategy FREQUENCY_SELECTIVE",
                 "set ENodeBFunction=1,EricssonLeanCarrier=1 leanCarrierEnabled true",
             ])
         elif sc == "A_COV_RET":
             lines.extend([
                 "",
-                "# --- Scenario A: Hardware RRU/RET Tilt & DL Coverage Protocol ---",
+                "# --- Scenario A: Bad CQI / MIMO Rank-1 / 256-QAM & Coverage Protocol ---",
                 "get RetSubUnit electricalAntennaTilt|iuantAntennaModelNumber|operationalState",
                 "hget RfPort vswrSupervisionSensitivity|vswrValue",
-                f"pget EUtranCellFDD={cell} pmRadioUeRepCqiDistr|pmRadioUeRepRankDistr",
-                f"get EUtranCellFDD={cell} crsGain|pdschTypeBGain",
+                f"pget EUtranCellFDD={cell} pmRadioUeRepCqiDistr|pmRadioHomUeRepCqiDistr|pmRadioUeRepRankDistr",
+                f"get EUtranCellFDD={cell} dl256QamEnabled|crsGain|pdschTypeBGain",
+                "set QciProfilePredefined=1 dlResourceAllocationStrategy FREQUENCY_SELECTIVE",
                 "set ENodeBFunction=1,EricssonLeanCarrier=1 leanCarrierEnabled true",
+                f"set EUtranCellFDD={cell} noOfPucchCqiUsers 200",
+                f"set EUtranCellFDD={cell} commonCqiPeriodicity 40",
             ])
         elif sc == "B_OOC":
             lines.extend([
@@ -1822,6 +1927,7 @@ def generate_amos_script(
                 f"pget EUtranCellFDD={cell} pmRrcConnEstabFailLic|pmErabEstabFailInitLic",
                 "invl",
                 "get CapacityState grantedCapacityLevel|operationalCapacityLevel",
+                "set ENodeBFunction=1,DynamicLoadControl=1 dlcEnabled true",
                 "set LoadBalancingFunction=1 lbCeiling 80",
             ])
         elif sc == "B_HW":
@@ -1838,37 +1944,42 @@ def generate_amos_script(
                 "# --- Scenario B: PDCCH / CCE Congestion Optimization ---",
                 f"pget EUtranCellFDD={cell} pmRaFailCbraMsg1DiscSched|pmRaFailCbraMsg2Disc",
                 f"set EUtranCellFDD={cell} pdcchCceOptimizationEnabled true",
-                f"set EUtranCellFDD={cell} pdcchPowerBoostMax 3",
+                f"set EUtranCellFDD={cell} pdcchPowerBoost 30",
             ])
         elif sc == "C_ULPC":
             lines.extend([
                 "",
                 "# --- Scenario C: High DCR & Uplink Power Control Optimization ---",
                 f"pget EUtranCellFDD={cell} pmErabRelAbnormalEnbAct|pmErabRelAbnormalEnbActUeLost",
-                f"get EUtranCellFDD={cell} p0NominalPusch|alpha|t310|n310",
-                f"set EUtranCellFDD={cell} p0NominalPusch -100",
-                f"set EUtranCellFDD={cell} alpha 8",
-                f"set EUtranCellFDD={cell} ulSrsEnable true",
+                f"get EUtranCellFDD={cell} crsGain|p0NominalPusch|alpha|t310|n310",
+                f"set EUtranCellFDD={cell} crsGain 0",
+                f"set EUtranCellFDD={cell} p0NominalPusch -95",
+                f"set EUtranCellFDD={cell} alpha ALPHA_08",
             ])
         elif sc in ("C1_INTRA_HO", "C_HO"):
             lines.extend([
                 "",
-                "# --- Scenario C1: Intra-Frequency Handover Remediation Protocol (Prep & Exe) ---",
+                "# --- Scenario D: Intra-Frequency Handover Remediation Protocol (Prep & Exe) ---",
                 f"pget EUtranCellFDD={cell} pmCellHoPrepAttLteIntraF|pmCellHoPrepSuccLteIntraF",
                 f"pget EUtranCellFDD={cell} pmCellHoExeAttLteIntraF|pmCellHoExeSuccLteIntraF|pmErabRelAbnormalEnbActHo",
+                f"pget EUtranCellFDD={cell} pmHoPrepRejInLicConnUsers|pmHoPrepRejOutUlThres",
                 f"get EUtranCellFDD={cell},EUtranCellRelation= hoAllowed|isHoAllowed|cellIndividualOffsetEUtran",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigEUtraBestCell=1 a3Offset 15",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigEUtraBestCell=1 timeToTrigger 40",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigEUtraBestCell=1 hysteresisA3 20",
+                f"set EUtranCellFDD={cell} speedDepMobilityEnabled true",
             ])
         elif sc == "C2_INTER_HO":
             lines.extend([
                 "",
-                "# --- Scenario C2: Inter-Frequency Handover Remediation Protocol (Prep & Exe) ---",
+                "# --- Scenario E: Inter-Frequency Handover & Measurement Gap Protocol ---",
                 f"pget EUtranCellFDD={cell} pmCellHoPrepAttLteInterF|pmCellHoPrepSuccLteInterF",
                 f"pget EUtranCellFDD={cell} pmCellHoExeAttLteInterF|pmCellHoExeSuccLteInterF",
+                f"pget EUtranCellFDD={cell},EUtranFreqRelation= pmHoPrepAtt|pmHoPrepSucc|pmHoExeAtt|pmHoExeSucc",
+                f"get EUtranCellFDD={cell},UeMeasControl=1 measGapPattern",
                 f"get EUtranCellFDD={cell},EUtranFreqRelation= hoAllowed|cellReselectionPriority",
-                f"get EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 a5Threshold1Rsrp|a5Threshold2Rsrp|timeToTrigger",
+                f"get EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 a5Threshold1Rsrp|a5Threshold2Rsrp|timeToTrigger|triggerQuantity",
+                f"set EUtranCellFDD={cell},UeMeasControl=1 measGapPattern 0",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 a5Threshold1Rsrp -110",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 a5Threshold2Rsrp -105",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigInterFreq=1 timeToTrigger 80",
@@ -1876,13 +1987,13 @@ def generate_amos_script(
         elif sc == "D_IRAT":
             lines.extend([
                 "",
-                "# --- Scenario D: 3G/4G IRAT Ping-Pong Mitigation Protocol ---",
-                f"pget EUtranCellFDD={cell} pmUeCtxtRelSCWcdma|pmUeCtxtRelCsfbWcdma|pmBadCovSearchEvalReport|pmB2BestCellEvalReport",
+                "# --- Scenario F: 3G/4G IRAT Ping-Pong Mitigation Protocol ---",
+                f"pget EUtranCellFDD={cell} pmBadCovEvalReport|pmBadCovSearchEvalReport|pmB2BestCellEvalReport|pmUeCtxtRelSCWcdma",
                 f"get EUtranCellFDD={cell},UeMeasControl=1 a2Threshold0Rsdp",
                 f"get EUtranCellFDD={cell},UeMeasControl=1,ReportConfigB2=1 b2Threshold1Rsdp|b2Threshold2RsdpUtran|timeToTrigger|hysteresis",
                 f"get EUtranCellFDD={cell},UtranFreqRelation= cellReselectionPriority|threshXLow|qRxLevMin",
                 f"set EUtranCellFDD={cell},UeMeasControl=1 a2Threshold0Rsdp -115",
-                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigB2=1 b2Threshold1Rsdp -116",
+                f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigB2=1 b2Threshold1Rsdp -118",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigB2=1 b2Threshold2RsdpUtran -95",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigB2=1 timeToTrigger 640",
                 f"set EUtranCellFDD={cell},UeMeasControl=1,ReportConfigB2=1 hysteresis 30",
@@ -1891,7 +2002,9 @@ def generate_amos_script(
         elif sc == "E_VOLTE":
             lines.extend([
                 "",
-                "# --- Scenario E: VoLTE QCI=1 Optimization Protocol ---",
+                "# --- Scenario G: VoLTE Dedicated Bearer (QCI=1) & SRVCC Protocol ---",
+                f"pget EUtranCellFDD={cell} pmErabEstabAttAddedQci|pmErabEstabSuccAddedQci",
+                f"pget EUtranCellFDD={cell} pmErabRelAbnormalEnbActQci|pmErabRelAbnormalEnbActUeLostQci",
                 "get QciProfilePredefined=qci1 preEmption|schedulingPolicy",
                 "set QciProfilePredefined=qci1 preEmptionCapability NOT_PREEMPTABLE",
                 "set QciProfilePredefined=qci1 preEmptionVulnerability DISABLED",
@@ -1901,23 +2014,57 @@ def generate_amos_script(
                 f"set EUtranCellFDD={cell} rohcEnabled true",
                 f"set EUtranCellFDD={cell} ttiBundlingEnabled true",
                 f"set EUtranCellFDD={cell},UtranCellRelation= srvccHoAllowed true",
+                f"get EUtranCellFDD={cell},UeMeasControl=1,ReportConfigUtran= b2Threshold1Rsrp|b2Threshold2UtraRscp",
             ])
         elif sc in ("TN_S1", "CORE_MME"):
             lines.extend([
                 "",
-                "# --- S1 Transport & EPC MME Core Supervision Check ---",
-                "st TermPointToMme",
+                "# --- Scenario C: S1 Transport & EPC MME Core Supervision Check ---",
+                "st sctp",
+                "st ethernet",
+                "get TermPointToMme",
                 "get Sctp errorCounter|assocMaxRtx",
                 f"pget EUtranCellFDD={cell} pmErabRelAbnormalMmeAct|pmErabRelAbnormalEnbActTnFail",
             ])
 
     lines.extend([
         "",
-        "confb-",
+        "# --- STEP 2: POST-EXECUTION VERIFICATION & STARTABLE CV SAVE ---",
+        f"st EUtranCellFDD={cell}",
+        "alt",
+        'cvms Post_Opt_Applied "Configuration version after optimization applied"',
+        "cvcu Post_Opt_Applied",
         "gs-",
-        "cvms Post_Antigravity_RCA_v8_Optimization",
+        "confb-",
     ])
     return "\n".join(lines)
+
+
+def _coerce_counter_or_param(series: pd.Series, col_name: str) -> pd.Series:
+    """Coerce PM counters to float (0.0 on NaN) while preserving NaN and boolean strings for MO parameters."""
+    if col_name in PARAMETER_COLS:
+        if series.dtype == object or pd.api.types.is_string_dtype(series):
+            mapped = (
+                series.astype(str)
+                .str.strip()
+                .str.lower()
+                .replace(
+                    {
+                        "true": "1",
+                        "enabled": "1",
+                        "yes": "1",
+                        "false": "0",
+                        "disabled": "0",
+                        "no": "0",
+                        "nan": np.nan,
+                        "none": np.nan,
+                        "": np.nan,
+                    }
+                )
+            )
+            return pd.to_numeric(mapped, errors="coerce")
+        return pd.to_numeric(series, errors="coerce")
+    return pd.to_numeric(series, errors="coerce").fillna(0.0)
 
 
 # ============================================================================
@@ -1930,7 +2077,7 @@ def analyze_counter_dump(
 ) -> AnalysisResult:
     """
     Ingest CSV or Excel (.xlsx, .xls) Ericsson PM counter dump, execute
-    vectorized 3GPP KPI aggregations, time-series synthesis, and v6.0.0 RCA trees.
+    vectorized 3GPP KPI aggregations, time-series synthesis, and v8.4.0 RCA trees.
     """
     ingestion_ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2058,7 +2205,7 @@ def analyze_counter_dump(
             base_f = prepared_frames[0]
             base_nums = [c for c in base_f.columns if c in SCALAR_COUNTERS]
             for c in base_nums:
-                base_f[c] = pd.to_numeric(base_f[c], errors="coerce").fillna(0.0)
+                base_f[c] = _coerce_counter_or_param(base_f[c], c)
             base_agg = {c: ("mean" if c in PARAMETER_COLS else "sum") for c in base_nums}
             if base_agg:
                 df_main = base_f.groupby(["eNodeB_Name", "EUtranCellFDD", "ROP_Time"], as_index=False).agg(base_agg)
@@ -2074,7 +2221,7 @@ def analyze_counter_dump(
                 if not num_extra:
                     continue
                 for c in num_extra:
-                    extra_f[c] = pd.to_numeric(extra_f[c], errors="coerce").fillna(0.0)
+                    extra_f[c] = _coerce_counter_or_param(extra_f[c], c)
                 extra_agg = {c: ("mean" if c in PARAMETER_COLS else "sum") for c in num_extra}
                 grp_extra = extra_f.groupby(["EUtranCellFDD", "ROP_Time"], as_index=False).agg(extra_agg)
                 df_main = df_main.merge(grp_extra, on=["EUtranCellFDD", "ROP_Time"], how="outer")
@@ -2125,7 +2272,7 @@ def analyze_counter_dump(
 
     present_counters = [c for c in SCALAR_COUNTERS if c in df_main.columns]
     for c in present_counters:
-        df_main[c] = pd.to_numeric(df_main[c], errors="coerce").fillna(0.0)
+        df_main[c] = _coerce_counter_or_param(df_main[c], c)
 
     has_3gpp_dcr_denom = any(
         c in present_counters and df_main[c].sum() > 0
@@ -2140,6 +2287,12 @@ def analyze_counter_dump(
     has_wide_cqi = all(c in df_main.columns for c in wide_cqi_cols)
     if has_wide_cqi:
         for c in wide_cqi_cols:
+            df_main[c] = pd.to_numeric(df_main[c], errors="coerce").fillna(0.0)
+
+    wide_hom_cols = [f"pmRadioHomUeRepCqiDistr[{i}]" for i in range(16)]
+    has_wide_hom = all(c in df_main.columns for c in wide_hom_cols)
+    if has_wide_hom:
+        for c in wide_hom_cols:
             df_main[c] = pd.to_numeric(df_main[c], errors="coerce").fillna(0.0)
 
     wide_rank_cols = [f"pmRadioUeRepRankDistr[{i}]" for i in range(4)]
@@ -2171,6 +2324,9 @@ def analyze_counter_dump(
             agg_dict[param_col] = "mean"
     if has_wide_cqi:
         for c in wide_cqi_cols:
+            agg_dict[c] = "sum"
+    if has_wide_hom:
+        for c in wide_hom_cols:
             agg_dict[c] = "sum"
     if has_wide_rank:
         for c in wide_rank_cols:
@@ -2310,12 +2466,30 @@ def analyze_counter_dump(
     cell_df["Intra_HO_Exe_SR"] = intra_exe_rate * 100.0
     cell_df["Intra_HOSR"] = intra_prep_rate * intra_exe_rate * 100.0
 
-    # 2.4 Inter-Frequency Mobility (v8.0.0: Separate Prep Phase SR & Exe Phase SR)
-    inter_prep_raw = cell_df["pmCellHoPrepAttLteInterF"]
+    # 2.4 Inter-Frequency Mobility (v8.4.0: Separate Prep Phase SR & Exe Phase SR + EUtranFreqRelation fallback)
+    use_cell_interf_prep = cell_df["pmCellHoPrepAttLteInterF"] > 0
+    inter_prep_raw = np.where(
+        use_cell_interf_prep,
+        cell_df["pmCellHoPrepAttLteInterF"],
+        cell_df["EUtranFreqRelation.pmHoPrepAtt"],
+    )
     inter_prep_formula_denom = inter_prep_raw + cell_df["pmHoPrepRejOutUlThres"]
-    inter_prep_succ = cell_df["pmCellHoPrepSuccLteInterF"]
-    inter_exe_att = cell_df["pmCellHoExeAttLteInterF"]
-    inter_exe_succ = cell_df["pmCellHoExeSuccLteInterF"]
+    inter_prep_succ = np.where(
+        use_cell_interf_prep,
+        cell_df["pmCellHoPrepSuccLteInterF"],
+        cell_df["EUtranFreqRelation.pmHoPrepSucc"],
+    )
+    use_cell_interf_exe = cell_df["pmCellHoExeAttLteInterF"] > 0
+    inter_exe_att = np.where(
+        use_cell_interf_exe,
+        cell_df["pmCellHoExeAttLteInterF"],
+        cell_df["EUtranFreqRelation.pmHoExeAtt"],
+    )
+    inter_exe_succ = np.where(
+        use_cell_interf_exe,
+        cell_df["pmCellHoExeSuccLteInterF"],
+        cell_df["EUtranFreqRelation.pmHoExeSucc"],
+    )
 
     inter_prep_rate = np.where(
         inter_prep_raw > 0,
@@ -2460,7 +2634,18 @@ def analyze_counter_dump(
         cell_radio_df, rop_radio_df = _process_cqi_long_sheet(df_cqi_all)
         cell_df = cell_df.merge(cell_radio_df, on="EUtranCellFDD", how="left")
     elif has_wide_cqi:
-        cqi_mat = cell_df[wide_cqi_cols].values
+        cqi_t1_mat = cell_df[wide_cqi_cols].values
+        if has_wide_hom:
+            hom_mat = cell_df[wide_hom_cols].values
+            cqi_mat = cqi_t1_mat + hom_mat
+            w_hom_tot = hom_mat.sum(axis=1)
+            w_hom_high = np.where(
+                w_hom_tot > 0, hom_mat[:, 12:16].sum(axis=1) / np.maximum(w_hom_tot, 1.0) * 100.0, np.nan
+            )
+        else:
+            cqi_mat = cqi_t1_mat
+            w_hom_tot = np.full(len(cell_df), np.nan)
+            w_hom_high = np.nan
         cqi_tot = cqi_mat.sum(axis=1)
         if has_wide_rank:
             r_mat = cell_df[wide_rank_cols].values
@@ -2481,13 +2666,14 @@ def analyze_counter_dump(
 
         wide_extra: Dict[str, Any] = {
             "CQI_Samples": cqi_tot,
+            "Hom_CQI_Samples": w_hom_tot,
             "Avg_CQI": np.where(
                 cqi_tot > 0, (cqi_mat @ np.arange(16, dtype=np.float64)) / np.maximum(cqi_tot, 1.0), np.nan
             ),
             "Low_CQI_Ratio": np.where(
                 cqi_tot > 0, cqi_mat[:, :7].sum(axis=1) / np.maximum(cqi_tot, 1.0) * 100.0, 0.0
             ),
-            "Hom_256QAM_Ratio": np.nan,
+            "Hom_256QAM_Ratio": w_hom_high,
             "Rank1_Ratio": w_rank1,
             "UL_Intf_dBm": w_intf_dbm,
             "Intf_Samples": w_intf_samples,
@@ -2498,6 +2684,7 @@ def analyze_counter_dump(
     else:
         fallback_radio: Dict[str, Any] = {
             "CQI_Samples": 0.0,
+            "Hom_CQI_Samples": np.nan,
             "Avg_CQI": np.nan,
             "Low_CQI_Ratio": 0.0,
             "Hom_256QAM_Ratio": np.nan,

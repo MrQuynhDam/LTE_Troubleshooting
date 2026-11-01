@@ -37,6 +37,7 @@ st.set_page_config(
 )
 
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "Data" / "Counters.xlsx"
+DEFAULT_README_PATH = Path(__file__).resolve().parent / "Data" / "Readme.pdf"
 
 TRIAGE_PRESETS = [
     "All Degraded",
@@ -313,7 +314,7 @@ def inject_cockpit_css() -> None:
             top: 3.75rem !important;
             right: 0 !important;
             bottom: 0 !important;
-            width: min(750px, 94vw) !important;
+            width: min(540px, 94vw) !important;
             z-index: 999990 !important;
             background: linear-gradient(180deg, #111827 0%, #0B0F19 100%) !important;
             border-left: 2px solid var(--cyan-hex) !important;
@@ -473,7 +474,7 @@ def inject_cockpit_css() -> None:
         .amos-hdr { color: #F8FAFC; font-weight: 700; }
 
         /* Crisp Action Buttons */
-        .stButton > button, .stDownloadButton > button {
+        .stButton > button, .stDownloadButton > button, [data-testid="stDownloadButton"] > button {
             border-radius: 7px !important;
             border: 1px solid #26354D !important;
             background-color: #151D2E !important;
@@ -483,12 +484,12 @@ def inject_cockpit_css() -> None:
             font-size: 0.80rem !important;
             transition: all 0.16s ease !important;
         }
-        .stButton > button:hover, .stDownloadButton > button:hover {
+        .stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stDownloadButton"] > button:hover {
             border-color: #38BDF8 !important;
             background-color: #1B2740 !important;
             color: #FFFFFF !important;
         }
-        .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
+        .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"], [data-testid="stDownloadButton"] > button[kind="primary"] {
             background: linear-gradient(135deg, #0284C7 0%, #0369A1 100%) !important;
             border-color: #38BDF8 !important;
             color: #FFFFFF !important;
@@ -523,7 +524,7 @@ def format_amos_terminal_html(amos_script: str) -> str:
             out_lines.append(f'<div class="amos-line amos-cmt">{html.escape(raw_line)}</div>')
         elif s.startswith("set "):
             out_lines.append(f'<div class="amos-line amos-set">{html.escape(raw_line)}</div>')
-        elif s.startswith(("moshell ", "confb", "gs+", "gs-", "lt ", "cvms ")):
+        elif s.startswith(("moshell ", "confb", "gs+", "gs-", "lt ", "cvms ", "cvls", "cvcu ")):
             out_lines.append(f'<div class="amos-line amos-hdr">{html.escape(raw_line)}</div>')
         else:
             out_lines.append(f'<div class="amos-line">{html.escape(raw_line)}</div>')
@@ -542,6 +543,13 @@ def load_default_dump(path_str: str, mtime: float) -> AnalysisResult:
     _ = mtime
     p = Path(path_str)
     return analyze_counter_dump(p, filename=p.name)
+
+
+@st.cache_data(show_spinner=False)
+def load_static_file_bytes(path_str: str, mtime: float) -> bytes:
+    """Cache static reference files (Counters.xlsx template & Readme.pdf manual) with mtime invalidation."""
+    _ = mtime
+    return Path(path_str).read_bytes()
 
 
 def _render_iframe(markup: str, height: int) -> None:
@@ -776,7 +784,7 @@ def build_cqi_stacked_chart(df: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         barmode="stack",
         title=dict(
-            text="Radio Quality — CQI Modulation Band Distribution (Worst Low-CQI Cells)",
+            text="Radio Quality — Unified CQI Band Distribution (T1 + 256-QAM T2, Worst Low-CQI Cells)",
             font=dict(family="Space Grotesk, sans-serif", size=13, color="#F8FAFC"),
             x=0.01,
             y=0.96,
@@ -1036,7 +1044,7 @@ def main() -> None:
               <div style="width:34px;height:34px;border-radius:8px;background:#151D2E;border:1px solid #38BDF8;display:flex;align-items:center;justify-content:center;font-weight:700;color:#38BDF8;font-family:'JetBrains Mono',monospace;">E///</div>
               <div>
                 <div style="font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:0.98rem;color:#F8FAFC;">RAN RCA COCKPIT</div>
-                <div style="font-size:0.70rem;color:#94A3B8;font-family:'JetBrains Mono',monospace;">ENM / AMOS Telemetry v8.0</div>
+                <div style="font-size:0.70rem;color:#94A3B8;font-family:'JetBrains Mono',monospace;">ENM / AMOS Telemetry v8.4 &bull; 25.Q3</div>
               </div>
             </div>
             """
@@ -1048,6 +1056,43 @@ def main() -> None:
             type=["xlsx", "xls", "csv"],
             help="Supports multi-sheet ENIQ/ENM dumps (Data / CSSR_DCR, CqiDistr, InterferencePwrPrb, VoLTE) and metadata header rows.",
         )
+
+        # Sample Counters.xlsx & Readme.pdf (25.Q3) Reference Downloads
+        if DEFAULT_DATASET_PATH.exists() or DEFAULT_README_PATH.exists():
+            st.markdown(
+                "<div style='font-size:0.73rem;color:#94A3B8;margin:4px 0 6px 0;font-weight:600;'>"
+                "📂 File mẫu &amp; Tài liệu hướng dẫn (25.Q3):</div>",
+                unsafe_allow_html=True,
+            )
+            dl_c1, dl_c2 = st.columns(2, gap="small")
+            with dl_c1:
+                if DEFAULT_DATASET_PATH.exists():
+                    sample_xlsx_bytes = load_static_file_bytes(
+                        str(DEFAULT_DATASET_PATH), DEFAULT_DATASET_PATH.stat().st_mtime
+                    )
+                    st.download_button(
+                        label="📥 Counters.xlsx",
+                        data=sample_xlsx_bytes,
+                        file_name="Counters.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        help="Tải file PM Counter mẫu chuẩn 4 sheets (Data, CqiDistr, InterferencePwrPrb, VoLTE)",
+                        key="dl_sample_counters_xlsx",
+                        width="stretch",
+                    )
+            with dl_c2:
+                if DEFAULT_README_PATH.exists():
+                    readme_pdf_bytes = load_static_file_bytes(
+                        str(DEFAULT_README_PATH), DEFAULT_README_PATH.stat().st_mtime
+                    )
+                    st.download_button(
+                        label="📘 Readme.pdf",
+                        data=readme_pdf_bytes,
+                        file_name="Readme.pdf",
+                        mime="application/pdf",
+                        help="Tải tài liệu kỹ thuật & cẩm nang vận hành LTE RAN Troubleshooting v8.4 (25.Q3)",
+                        key="dl_manual_readme_pdf",
+                        width="stretch",
+                    )
 
         # Load uploaded file or auto-ingest default Data/Counters.xlsx
         try:

@@ -634,7 +634,7 @@ def build_html_report(
   {"".join(deep_cards)}
 
   <div class="footer-note mono">
-    Antigravity Principal RAN Performance &amp; Optimization Suite &bull; 3GPP / Ericsson MOM Deterministic RCA Engine v8.0
+    Antigravity Principal RAN Performance &amp; Optimization Suite &bull; 3GPP / Ericsson MOM Deterministic RCA Engine v8.4 (25.Q3)
   </div>
 
 </body>
