@@ -1,1868 +1,1213 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Ericsson LTE RAN Performance & Automated Root-Cause Analysis (RCA) Cockpit.
-
-Hybrid Telemetry Cockpit (12-Column Grid) with High-Density Dark OLED (#0B0F19)
-aesthetic, Multi-Tier Collapsible Sidebar Filters, Cross-Filtering Pareto Charts,
-Slide-Over Diagnostic Evidence Drawer, One-Click AMOS/Moshell Terminal Copy,
-and Executive HTML-to-PDF Report Exporter.
+Antigravity Ericsson LTE & VoLTE Telemetry, RCA & AMOS Cockpit
+Design System: NOC Hybrid Telemetry Cockpit — Dark OLED (#0B0F19)
 """
 
 from __future__ import annotations
 
-import base64
-import html
-import json
-from pathlib import Path
-from typing import List, Optional
+import hashlib
+import os
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-import streamlit.components.v1 as components
 
-from pdf_generator import export_report_to_pdf
-from rca_engine import AnalysisResult, analyze_counter_dump, compute_rop_series
+from pdf_generator import generate_diagnostic_pdf
+from rca_engine import (
+     compute_executive_metrics,
+    convert_prb_row_to_dbm,
+    generate_amos_script,
+    get_col,
+    load_and_process_Counters,
+    natural_prb_cols,
+    resolve_default_workbook,
+    safe_div,
+)
 
-# ============================================================================
-# 1. PAGE CONFIG & DESIGN SYSTEM CSS (HIGH-DENSITY DARK OLED #0B0F19)
-# ============================================================================
+# ==============================================================================
+# 1. PAGE CONFIGURATION & NOC DARK OLED DESIGN SYSTEM
+# ==============================================================================
 
 st.set_page_config(
-    page_title="Ericsson LTE RAN Telemetry & RCA Cockpit",
+    page_title="Ericsson LTE & VoLTE RAN Diagnostic Cockpit",
     page_icon="📡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "Data" / "Counters.xlsx"
-DEFAULT_README_PATH = Path(__file__).resolve().parent / "Data" / "Readme.pdf"
+NOC_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap');
+
+:root {
+    --bg-oled: #0B0F19;
+    --bg-card: #151D2E;
+    --bg-card-hover: #1B263B;
+    --border-subtle: #1E293B;
+    --border-bright: #334155;
+    --text-primary: #F8FAFC;
+    --text-secondary: #94A3B8;
+    --text-muted: #64748B;
+    --accent-cyan: #38BDF8;
+    --sev-critical: #FF4D4F;
+    --sev-degraded: #FAAD14;
+    --sev-normal: #52C41A;
+    --sev-insig: #64748B;
+}
+
+html, body, [data-testid="stAppViewContainer"], .stApp {
+    background-color: var(--bg-oled) !important;
+    color: var(--text-primary) !important;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+[data-testid="stSidebar"] {
+    background-color: #0E1422 !important;
+    border-right: 1px solid var(--border-subtle) !important;
+}
+
+[data-testid="stHeader"] {
+    background-color: rgba(11, 15, 25, 0.85) !important;
+}
+
+.block-container {
+    padding-top: 1.1rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 100% !important;
+}
+
+h1, h2, h3, .noc-heading {
+    font-family: 'Space Grotesk', sans-serif !important;
+    letter-spacing: -0.02em;
+}
+
+.mono-num {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-variant-numeric: tabular-nums !important;
+}
+
+/* Top Telemetry Header Bar */
+.telemetry-banner {
+    background: linear-gradient(180deg, #151D2E 0%, #101726 100%);
+    border: 1px solid var(--border-subtle);
+    border-left: 4px solid var(--accent-cyan);
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin-bottom: 12px;
+}
+.telemetry-title {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 1.28rem;
+    font-weight: 700;
+    color: #F8FAFC;
+    margin: 0 0 4px 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.telemetry-meta {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.78rem;
+    color: #94A3B8;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+}
+.meta-chip {
+    background: rgba(15, 23, 42, 0.85);
+    border: 1px solid #1E293B;
+    border-radius: 5px;
+    padding: 2px 8px;
+    color: #E2E8F0;
+}
+.meta-chip b {
+    color: #38BDF8;
+}
+
+/* Tier 1 Executive KPI Cards */
+.kpi-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 13px 15px;
+    height: 112px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    transition: border-color 0.18s ease, transform 0.18s ease;
+}
+.kpi-card:hover {
+    border-color: var(--border-bright);
+    transform: translateY(-1px);
+}
+.kpi-card.crit { border-top: 3px solid var(--sev-critical); }
+.kpi-card.deg  { border-top: 3px solid var(--sev-degraded); }
+.kpi-card.norm { border-top: 3px solid var(--sev-normal); }
+.kpi-card.info { border-top: 3px solid var(--accent-cyan); }
+
+.kpi-label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+.kpi-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 1.55rem;
+    font-weight: 700;
+    line-height: 1.15;
+    color: var(--text-primary);
+}
+.kpi-sub {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.72rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* Semantic Status Badges */
+.sev-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 3px 9px;
+    border-radius: 5px;
+    letter-spacing: 0.03em;
+    display: inline-block;
+}
+.sev-CRITICAL {
+    color: #FF4D4F;
+    background: rgba(255, 77, 79, 0.14);
+    border: 1px solid rgba(255, 77, 79, 0.45);
+}
+.sev-DEGRADED {
+    color: #FAAD14;
+    background: rgba(250, 173, 20, 0.14);
+    border: 1px solid rgba(250, 173, 20, 0.45);
+}
+.sev-NORMAL {
+    color: #52C41A;
+    background: rgba(82, 196, 26, 0.14);
+    border: 1px solid rgba(82, 196, 26, 0.45);
+}
+.sev-STAT_INSIGNIFICANT {
+    color: #94A3B8;
+    background: rgba(100, 116, 139, 0.18);
+    border: 1px solid rgba(100, 116, 139, 0.45);
+}
+
+/* Section Panels & Inspector Card */
+.panel-hdr {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.98rem;
+    font-weight: 700;
+    color: #F1F5F9;
+    padding-bottom: 6px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.inspector-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+}
+.evidence-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 7px;
+    margin-top: 10px;
+}
+.ev-cell {
+    background: #0B0F19;
+    border: 1px solid #1E293B;
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+.ev-lbl {
+    font-size: 0.66rem;
+    color: #94A3B8;
+    text-transform: uppercase;
+}
+.ev-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #F8FAFC;
+}
+
+/* Button Polish */
+div.stDownloadButton > button, div.stButton > button {
+    border-radius: 7px !important;
+    border: 1px solid #334155 !important;
+    font-weight: 600 !important;
+    transition: all 0.15s ease !important;
+}
+div.stDownloadButton > button:hover, div.stButton > button:hover {
+    border-color: #38BDF8 !important;
+    color: #38BDF8 !important;
+}
+</style>
+"""
+st.markdown(NOC_CSS, unsafe_allow_html=True)
+
+PLOTLY_BG = "#151D2E"
+PLOTLY_PAPER = "#151D2E"
+PLOTLY_GRID = "#1E293B"
+PLOTLY_FONT = "JetBrains Mono, monospace"
+
+
+# ==============================================================================
+# 2. CACHED DATA LOADING & PDF GENERATION
+# ==============================================================================
+
+@st.cache_data(show_spinner=False)
+def cached_load_path(file_path: str, mtime: float) -> Dict[str, Any]:
+    return load_and_process_Counters(file_path)
+
+
+@st.cache_data(show_spinner=False)
+def cached_load_bytes(raw_bytes: bytes, filename: str, digest: str) -> Dict[str, Any]:
+    import io
+    return load_and_process_Counters(io.BytesIO(raw_bytes), source_name=filename)
+
+
+def base_plotly_layout(fig: go.Figure, height: int = 330, title: str = "") -> go.Figure:
+    fig.update_layout(
+        title=dict(text=title, font=dict(family="Space Grotesk, sans-serif", size=13, color="#E2E8F0"), x=0.01),
+        height=height,
+        margin=dict(l=48, r=36, t=38 if title else 18, b=38),
+        paper_bgcolor=PLOTLY_PAPER,
+        plot_bgcolor=PLOTLY_BG,
+        font=dict(family=PLOTLY_FONT, size=11, color="#CBD5E1"),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1.0,
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=10.5),
+        ),
+        hoverlabel=dict(bgcolor="#0B0F19", bordercolor="#38BDF8", font=dict(family=PLOTLY_FONT, size=11, color="#F8FAFC")),
+    )
+    fig.update_xaxes(gridcolor=PLOTLY_GRID, zerolinecolor=PLOTLY_GRID, linecolor="#334155")
+    fig.update_yaxes(gridcolor=PLOTLY_GRID, zerolinecolor=PLOTLY_GRID, linecolor="#334155")
+    return fig
+
+
+# ==============================================================================
+# 3. COLLAPSIBLE SIDEBAR: DATA INGESTION & MULTI-LAYER FILTERS
+# ==============================================================================
 
 TRIAGE_PRESETS = [
-    "All Degraded",
+    "Show All (Full Network)",
+    "All Degraded / Critical",
     "Drop Call Spike (DCR > 1%)",
-    "Handover / RACH Issue (Intra/Inter HOSR)",
     "Accessibility Failure (CSSR < 97%)",
-    "IRAT Ping-Pong Loop (> 5%)",
-    "Radio Quality / CQI Degraded",
-    "All Evaluated Cells",
+    "Mobility Failure (HOSR < 96%)",
+    "VoLTE QCI=1 Degradation",
+    "High UL Interference / PIM (> -110 dBm)",
+    "IRAT Offload Loop (> 5%)",
 ]
 
 
-def inject_cockpit_css() -> None:
-    """Apply High-Density Dark OLED (#0B0F19) NOC Design System & Tabular Monospace."""
+def _reset_filters() -> None:
+    st.session_state["flt_preset"] = "Show All (Full Network)"
+    st.session_state["flt_erbs"] = []
+    st.session_state["flt_cell"] = []
+    st.session_state["flt_earfcn"] = []
+    st.session_state["flt_date"] = []
+    st.session_state["flt_hour"] = []
+    st.session_state["flt_rca"] = []
+    st.session_state["selected_cell_id"] = None
+    st.session_state["selected_rop_time"] = None
+
+
+for _k, _default in [
+    ("flt_preset", "Show All (Full Network)"),
+    ("flt_erbs", []),
+    ("flt_cell", []),
+    ("flt_earfcn", []),
+    ("flt_date", []),
+    ("flt_hour", []),
+    ("flt_rca", []),
+    ("view_mode", "Aggregated Cell View"),
+    ("selected_cell_id", None),
+    ("selected_rop_time", None),
+]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _default
+
+with st.sidebar:
     st.markdown(
-        """
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+        "<div class='noc-heading' style='font-size:1.08rem;color:#38BDF8;margin-bottom:4px;'>"
+        "📡 ANTIGRAVITY RAN v9.0</div>"
+        "<div style='font-size:0.75rem;color:#94A3B8;margin-bottom:10px;'>"
+        "Ericsson LTE & VoLTE Diagnostics + AMOS Engine</div>",
+        unsafe_allow_html=True,
+    )
 
-        :root {
-            --bg-oled: #0B0F19;
-            --bg-card: #151D2E;
-            --bg-card-hover: #1B253B;
-            --border-hairline: #1E293B;
-            --border-accent: rgba(56, 189, 248, 0.38);
-            --text-primary: #F1F5F9;
-            --text-secondary: #94A3B8;
-            --text-muted: #64748B;
-            --crit-hex: #FF4D4F;
-            --crit-bg: rgba(255, 77, 79, 0.10);
-            --crit-bdr: rgba(255, 77, 79, 0.40);
-            --deg-hex: #FAAD14;
-            --deg-bg: rgba(250, 173, 20, 0.10);
-            --deg-bdr: rgba(250, 173, 20, 0.40);
-            --norm-hex: #52C41A;
-            --norm-bg: rgba(82, 196, 26, 0.10);
-            --norm-bdr: rgba(82, 196, 26, 0.40);
-            --cyan-hex: #38BDF8;
-        }
+    uploaded = st.file_uploader(
+        "Drag & Drop BO / ENIQ Dump (.xlsx, .xls, .csv)",
+        type=["xlsx", "xls", "csv"],
+        help="Supports raw 4-sheet SAP BusinessObjects Counters.xlsx, 3-sheet Counters_Organized.xlsx, or flat CSV.",
+    )
 
-        /* Base App Surface */
-        .stApp, [data-testid="stAppViewContainer"] {
-            background-color: var(--bg-oled) !important;
-            color: var(--text-primary) !important;
-            font-family: 'Inter', system-ui, -apple-system, sans-serif;
-        }
-        [data-testid="stHeader"] {
-            background: rgba(11, 15, 25, 0.90) !important;
-            backdrop-filter: blur(8px);
-            border-bottom: 1px solid rgba(30, 41, 59, 0.65);
-        }
-        [data-testid="stMainBlockContainer"], .block-container {
-            padding-top: 3.95rem !important;
-            padding-bottom: 2.5rem !important;
-            padding-left: 1.5rem !important;
-            padding-right: 1.5rem !important;
-            max-width: 100% !important;
-        }
+    with st.spinner("Executing Vectorized 4-Sheet ETL & 3GPP/Ericsson RCA Trees..."):
+        if uploaded is not None:
+            raw_bytes = uploaded.getvalue()
+            digest = hashlib.md5(raw_bytes).hexdigest()
+            bundle = cached_load_bytes(raw_bytes, uploaded.name, digest)
+        else:
+            default_path = resolve_default_workbook()
+            if not default_path:
+                st.error("No `Counters.xlsx` found in workspace or `./Data/`. Please upload a file.")
+                st.stop()
+            bundle = cached_load_path(default_path, os.path.getmtime(default_path))
 
-        /* Sidebar Styling */
-        [data-testid="stSidebar"] {
-            background-color: #0E1422 !important;
-            border-right: 1px solid var(--border-hairline) !important;
-        }
-        [data-testid="stSidebar"] h1,
-        [data-testid="stSidebar"] h2,
-        [data-testid="stSidebar"] h3 {
-            font-family: 'Space Grotesk', sans-serif !important;
-            letter-spacing: -0.02em;
-        }
+    hourly_all: pd.DataFrame = bundle["hourly_df"]
+    cell_all: pd.DataFrame = bundle["cell_df"]
+    prb_hourly_all: Optional[pd.DataFrame] = bundle["prb_hourly_df"]
+    prb_cell_all: Optional[pd.DataFrame] = bundle["prb_cell_df"]
+    meta: Dict[str, Any] = bundle["meta"]
 
-        /* Typography Classes */
-        h1, h2, h3, .noc-heading {
-            font-family: 'Space Grotesk', sans-serif !important;
-            letter-spacing: -0.025em;
-            color: var(--text-primary);
-        }
-        .mono-num {
-            font-family: 'JetBrains Mono', 'Roboto Mono', monospace !important;
-            font-variant-numeric: tabular-nums;
-        }
+    st.divider()
+    st.markdown("**⚡ Quick Triage Presets**")
+    selected_preset = st.selectbox(
+        "Diagnostic Triage Filter",
+        options=TRIAGE_PRESETS,
+        key="flt_preset",
+        label_visibility="collapsed",
+    )
 
-        /* Top Telemetry Header */
-        .telemetry-bar {
-            background: linear-gradient(135deg, #111827 0%, #151D2E 65%, #0F172A 100%);
-            border: 1px solid var(--border-hairline);
-            border-left: 3px solid var(--cyan-hex);
-            border-radius: 10px;
-            padding: 12px 18px;
-            margin-bottom: 12px;
-            display: flex;
-            flex-wrap: wrap;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-        }
-        .telemetry-brand {
-            display: flex;
-            align-items: center;
-            gap: 14px;
-        }
-        .telemetry-title {
-            font-family: 'Space Grotesk', sans-serif;
-            font-size: 1.18rem;
-            font-weight: 700;
-            color: #F8FAFC;
-            margin: 0;
-            line-height: 1.2;
-        }
-        .telemetry-sub {
-            font-size: 0.78rem;
-            color: var(--text-secondary);
-            margin-top: 3px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: center;
-        }
-        .fresh-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 3px 10px;
-            border-radius: 5px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.72rem;
-            font-weight: 600;
-            background: rgba(82, 196, 26, 0.12);
-            color: #52C41A;
-            border: 1px solid rgba(82, 196, 26, 0.38);
-        }
-        .pulse-dot {
-            width: 7px;
-            height: 7px;
-            border-radius: 50%;
-            background: #52C41A;
-            box-shadow: 0 0 8px #52C41A;
-        }
-        .meta-chip {
-            background: rgba(15, 23, 42, 0.85);
-            border: 1px solid var(--border-hairline);
-            border-radius: 5px;
-            padding: 2px 8px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.73rem;
-            color: #CBD5E1;
-        }
+    st.markdown("**🎛️ Granular Multi-Select Filters**")
+    erbs_opts = sorted(hourly_all["ERBS Id"].dropna().unique().tolist()) if "ERBS Id" in hourly_all.columns else []
+    sel_erbs = st.multiselect("ERBS Id (eNodeB)", options=erbs_opts, key="flt_erbs")
 
-        /* Tier 1 Executive KPI Cards */
-        .kpi-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-hairline);
-            border-radius: 10px;
-            padding: 14px 16px;
-            position: relative;
-            overflow: hidden;
-            transition: border-color 0.18s ease, transform 0.18s ease, background 0.18s ease;
-            min-height: 112px;
-        }
-        .kpi-card:hover {
-            background: var(--bg-card-hover);
-            border-color: var(--border-accent);
-            transform: translateY(-1px);
-        }
-        .kpi-card::before {
-            content: "";
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 2px;
-            background: var(--cyan-hex);
-        }
-        .kpi-card.card-crit::before { background: var(--crit-hex); }
-        .kpi-card.card-deg::before { background: var(--deg-hex); }
-        .kpi-card.card-norm::before { background: var(--norm-hex); }
+    cell_pool = hourly_all[hourly_all["ERBS Id"].isin(sel_erbs)] if sel_erbs else hourly_all
+    cell_opts = sorted(cell_pool["EUtranCell Id"].dropna().unique().tolist()) if "EUtranCell Id" in cell_pool.columns else []
+    sel_cells = st.multiselect("EUtranCell Id", options=cell_opts, key="flt_cell")
 
-        .kpi-label {
-            font-size: 0.73rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            color: var(--text-secondary);
-            margin-bottom: 6px;
-        }
-        .kpi-value-row {
-            display: flex;
-            align-items: baseline;
-            justify-content: space-between;
-            gap: 8px;
-        }
-        .kpi-value {
-            font-family: 'JetBrains Mono', monospace;
-            font-variant-numeric: tabular-nums;
-            font-size: 1.68rem;
-            font-weight: 700;
-            color: #F8FAFC;
-            line-height: 1.15;
-        }
-        .kpi-foot {
-            margin-top: 8px;
-            font-size: 0.75rem;
-            color: var(--text-secondary);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 6px;
-        }
+    earfcn_opts = sorted(hourly_all["earfcndl"].dropna().astype(int).unique().tolist()) if "earfcndl" in hourly_all.columns else []
+    sel_earfcn = st.multiselect("Carrier Layer (earfcndl)", options=earfcn_opts, key="flt_earfcn")
 
-        /* Semantic Status Badges */
-        .status-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            padding: 2px 8px;
-            border-radius: 5px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.71rem;
-            font-weight: 700;
-            letter-spacing: 0.04em;
-        }
-        .badge-critical {
-            color: var(--crit-hex);
-            background: var(--crit-bg);
-            border: 1px solid var(--crit-bdr);
-        }
-        .badge-degraded {
-            color: var(--deg-hex);
-            background: var(--deg-bg);
-            border: 1px solid var(--deg-bdr);
-        }
-        .badge-normal {
-            color: var(--norm-hex);
-            background: var(--norm-bg);
-            border: 1px solid var(--norm-bdr);
-        }
-        .badge-low {
-            color: #94A3B8;
-            background: rgba(148, 163, 184, 0.10);
-            border: 1px solid rgba(148, 163, 184, 0.30);
-        }
+    date_opts = sorted(hourly_all["Date"].dropna().astype(str).unique().tolist()) if "Date" in hourly_all.columns else []
+    sel_dates = st.multiselect("Date", options=date_opts, key="flt_date")
 
-        /* Panel Containers */
-        .panel-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 8px 12px;
-            background: var(--bg-card);
-            border: 1px solid var(--border-hairline);
-            border-radius: 8px;
-            margin-bottom: 8px;
-        }
-        .panel-title {
-            font-family: 'Space Grotesk', sans-serif;
-            font-size: 0.92rem;
-            font-weight: 600;
-            color: #F8FAFC;
-            letter-spacing: -0.01em;
-        }
-        .panel-hint {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.71rem;
-            color: var(--cyan-hex);
-        }
+    hour_opts = sorted(hourly_all["Hour"].dropna().astype(int).unique().tolist()) if "Hour" in hourly_all.columns else []
+    sel_hours = st.multiselect("Hour (00..23)", options=hour_opts, key="flt_hour")
 
-        /* True Off-Canvas Fixed Slide-Over Inspector Drawer */
-        @keyframes slideOverFromRight {
-            from { opacity: 0; transform: translateX(100%); }
-            to   { opacity: 1; transform: translateX(0); }
-        }
-        .st-key-slide_over_drawer {
-            position: fixed !important;
-            top: 3.75rem !important;
-            right: 0 !important;
-            bottom: 0 !important;
-            width: min(540px, 94vw) !important;
-            z-index: 999990 !important;
-            background: linear-gradient(180deg, #111827 0%, #0B0F19 100%) !important;
-            border-left: 2px solid var(--cyan-hex) !important;
-            box-shadow: -24px 0 64px rgba(0, 0, 0, 0.85) !important;
-            padding: 14px 18px 28px 18px !important;
-            overflow-y: auto !important;
-            animation: slideOverFromRight 0.26s cubic-bezier(0.16, 1, 0.3, 1) !important;
-        }
-        .inspector-drawer {
-            background: rgba(21, 29, 46, 0.72);
-            border: 1px solid var(--border-hairline);
-            border-left: 3px solid var(--cyan-hex);
-            border-radius: 10px;
-            padding: 14px 15px;
-        }
-        .inspector-drawer.drawer-CRITICAL { border-left-color: var(--crit-hex); }
-        .inspector-drawer.drawer-DEGRADED { border-left-color: var(--deg-hex); }
-        .inspector-drawer.drawer-NORMAL   { border-left-color: var(--norm-hex); }
+    rca_opts = sorted(hourly_all["RCA_Category"].dropna().unique().tolist()) if "RCA_Category" in hourly_all.columns else []
+    sel_rca = st.multiselect("RCA Category", options=rca_opts, key="flt_rca")
 
-        .drawer-top {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            border-bottom: 1px solid var(--border-hairline);
-            padding-bottom: 10px;
-            margin-bottom: 10px;
-        }
-        .drawer-cell-id {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 1.05rem;
-            font-weight: 700;
-            color: #F8FAFC;
-        }
-        .drawer-enb-id {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.76rem;
-            color: var(--text-secondary);
-            margin-top: 2px;
-        }
-        .rca-callout {
-            background: rgba(11, 15, 25, 0.75);
-            border: 1px solid var(--border-hairline);
-            border-radius: 7px;
-            padding: 10px 12px;
-            margin-bottom: 10px;
-            font-size: 0.81rem;
-            line-height: 1.45;
-        }
-        .mini-kpi-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 6px;
-            margin-bottom: 10px;
-        }
-        .mini-kpi-grid.cols-4 {
-            grid-template-columns: repeat(4, 1fr);
-        }
-        .mini-kpi-grid.cols-5 {
-            grid-template-columns: repeat(5, 1fr);
-        }
-        .mini-kpi-grid.cols-5 .mk-val {
-            font-size: 0.78rem;
-        }
-        .mini-kpi {
-            background: #0B0F19;
-            border: 1px solid var(--border-hairline);
-            border-radius: 6px;
-            padding: 6px 6px;
-            text-align: center;
-        }
-        .mini-kpi .mk-lbl {
-            font-size: 0.65rem;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-        }
-        .mini-kpi .mk-val {
-            font-family: 'JetBrains Mono', monospace;
-            font-variant-numeric: tabular-nums;
-            font-size: 0.84rem;
-            font-weight: 700;
-            color: #F8FAFC;
-            margin-top: 2px;
-        }
+    st.button("🔄 Reset All Filters", on_click=_reset_filters, use_container_width=True)
 
-        /* Diagnostic Evidence Table */
-        table.ev-grid {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.74rem;
-            margin-bottom: 10px;
-            background: #0B0F19;
-            border-radius: 6px;
-            overflow: hidden;
-        }
-        table.ev-grid th {
-            background: #151D2E;
-            color: #94A3B8;
-            text-align: left;
-            padding: 5px 8px;
-            font-weight: 600;
-            border-bottom: 1px solid var(--border-hairline);
-        }
-        table.ev-grid td {
-            padding: 4.5px 8px;
-            border-bottom: 1px solid rgba(30, 41, 59, 0.65);
-            color: #E2E8F0;
-        }
-        table.ev-grid td.mono {
-            font-family: 'JetBrains Mono', monospace;
-            font-variant-numeric: tabular-nums;
-        }
 
-        /* Pure Black OLED AMOS Terminal */
-        .amos-terminal-wrap {
-            background: #000000;
-            border: 1px solid #1E293B;
-            border-radius: 8px;
-            padding: 10px 12px;
-            margin-top: 6px;
-        }
-        .amos-term-bar {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid #1E293B;
-            padding-bottom: 6px;
-            margin-bottom: 8px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.71rem;
-            color: #94A3B8;
-        }
-        .amos-dots span {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            margin-right: 4px;
-        }
-        .amos-code-box {
-            margin: 0;
-            background: #000000;
-            color: #38BDF8;
-            font-family: 'JetBrains Mono', 'Roboto Mono', Consolas, monospace;
-            font-size: 0.73rem;
-            line-height: 1.45;
-            max-height: 240px;
-            overflow-y: auto;
-            padding: 2px 0;
-        }
-        .amos-line {
-            white-space: pre-wrap;
-            word-break: break-word;
-            font-family: 'JetBrains Mono', 'Roboto Mono', Consolas, monospace;
-        }
-        .amos-cmt { color: #6EE7B7; }
-        .amos-set { color: #FBBF24; font-weight: 600; }
-        .amos-hdr { color: #F8FAFC; font-weight: 700; }
+# ==============================================================================
+# 4. APPLY GRANULAR & TRIAGE FILTERS TO HOURLY & CELL DATAFRAMES
+# ==============================================================================
 
-        /* Crisp Action Buttons */
-        .stButton > button, .stDownloadButton > button, [data-testid="stDownloadButton"] > button {
-            border-radius: 7px !important;
-            border: 1px solid #26354D !important;
-            background-color: #151D2E !important;
-            color: #F1F5F9 !important;
-            font-family: 'Inter', sans-serif !important;
-            font-weight: 600 !important;
-            font-size: 0.80rem !important;
-            transition: all 0.16s ease !important;
-        }
-        .stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stDownloadButton"] > button:hover {
-            border-color: #38BDF8 !important;
-            background-color: #1B2740 !important;
-            color: #FFFFFF !important;
-        }
-        .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"], [data-testid="stDownloadButton"] > button[kind="primary"] {
-            background: linear-gradient(135deg, #0284C7 0%, #0369A1 100%) !important;
-            border-color: #38BDF8 !important;
-            color: #FFFFFF !important;
-        }
-        </style>
+def _apply_scope_filters(df: pd.DataFrame, is_hourly: bool) -> pd.DataFrame:
+    res = df
+    if sel_erbs and "ERBS Id" in res.columns:
+        res = res[res["ERBS Id"].isin(sel_erbs)]
+    if sel_cells and "EUtranCell Id" in res.columns:
+        res = res[res["EUtranCell Id"].isin(sel_cells)]
+    if sel_earfcn and "earfcndl" in res.columns:
+        res = res[res["earfcndl"].astype(int).isin(sel_earfcn)]
+    if is_hourly:
+        if sel_dates and "Date" in res.columns:
+            res = res[res["Date"].astype(str).isin(sel_dates)]
+        if sel_hours and "Hour" in res.columns:
+            res = res[res["Hour"].astype(int).isin(sel_hours)]
+    return res
+
+
+def _apply_triage_preset(df: pd.DataFrame, preset: str) -> pd.DataFrame:
+    res = df
+    if preset == "All Degraded / Critical":
+        res = res[res["Severity"].isin(["CRITICAL", "DEGRADED"])]
+    elif preset == "Drop Call Spike (DCR > 1%)":
+        res = res[(res["DCR_Denom"] >= 30) & (res["DCR_Overall_Pct"] > 1.0)]
+    elif preset == "Accessibility Failure (CSSR < 97%)":
+        res = res[(res["CSSR_Denom"] >= 30) & (res["CSSR_Pct"] < 97.0)]
+    elif preset == "Mobility Failure (HOSR < 96%)":
+        res = res[
+            ((res["Combined_HO_Att"] >= 20) & (res["Combined_HOSR_Pct"] < 96.0))
+            | ((get_col(res, "pmCellHoPrepAttLteIntraF") >= 20) & (res["Intra_Freq_HOSR_Pct"] < 96.0))
+            | ((get_col(res, "pmCellHoPrepAttLteInterF") >= 20) & (res["Inter_Freq_HOSR_Pct"] < 94.0))
+        ]
+    elif preset == "VoLTE QCI=1 Degradation":
+        res = res[
+            ((res["VoLTE_DCR_Denom"] >= 10) & (res["VoLTE_DCR_Rel_Pct"] > 0.8))
+            | ((res["VoLTE_CSSR_Denom"] >= 10) & (res["VoLTE_CSSR_RAN_Pct"] < 97.5))
+        ]
+    elif preset == "High UL Interference / PIM (> -110 dBm)":
+        res = res[
+            (res["UL_Interf_Avg_dBm"] > -110.0)
+            | ((get_col(res, "PRB_Max_dBm", -121.0) > -105.0) & (res["PRB_Peak_to_Median_dB"] > 6.0))
+        ]
+    elif preset == "IRAT Offload Loop (> 5%)":
+        res = res[(get_col(res, "pmRrcConnEstabSucc") >= 30) & (res["IRAT_Offload_Pct"] > 5.0)]
+
+    if sel_rca and "RCA_Category" in res.columns:
+        res = res[res["RCA_Category"].isin(sel_rca)]
+    return res.reset_index(drop=True)
+
+
+# If Date/Hour filter is active in Aggregated Cell View, re-aggregate dynamically from filtered hourly rows!
+hourly_scoped = _apply_scope_filters(hourly_all, is_hourly=True)
+if sel_dates or sel_hours:
+    from rca_engine import aggregate_to_cell_level, compute_kpis_and_rca
+    prb_h_sub = _apply_scope_filters(prb_hourly_all, is_hourly=True) if prb_hourly_all is not None else None
+    c_raw_sub, prb_cell_scoped = aggregate_to_cell_level(hourly_scoped, prb_h_sub)
+    cell_scoped = compute_kpis_and_rca(c_raw_sub, is_aggregated=True)
+else:
+    cell_scoped = _apply_scope_filters(cell_all, is_hourly=False)
+    prb_cell_scoped = prb_cell_all
+
+
+# ==============================================================================
+# 5. TOP TELEMETRY HEADER (VIEW TOGGLE + PDF EXPORT)
+# ==============================================================================
+
+hdr_col_left, hdr_col_mid, hdr_col_right = st.columns([6.2, 3.3, 2.5], vertical_alignment="center")
+
+with hdr_col_mid:
+    view_mode = st.radio(
+        "Telemetry Granularity",
+        options=["Aggregated Cell View", "Hourly ROP View"],
+        horizontal=True,
+        key="view_mode",
+        label_visibility="collapsed",
+    )
+
+is_cell_view = view_mode == "Aggregated Cell View"
+active_scope_df = cell_scoped if is_cell_view else hourly_scoped
+active_filtered_df = _apply_triage_preset(active_scope_df, selected_preset)
+exec_metrics = compute_executive_metrics(active_scope_df)
+
+with hdr_col_left:
+    st.markdown(
+        f"""
+        <div class="telemetry-banner">
+            <div class="telemetry-title">
+                <span>ERICSSON LTE &amp; VoLTE RAN DIAGNOSTIC COCKPIT</span>
+                <span class="sev-badge sev-NORMAL" style="font-size:0.68rem;">SKILL ENGINE v9.0</span>
+            </div>
+            <div class="telemetry-meta">
+                <span class="meta-chip">📄 File: <b>{meta['filename']}</b></span>
+                <span class="meta-chip">📅 Date: <b>{meta['date_range']}</b></span>
+                <span class="meta-chip">🗼 ERBS: <b>{meta['total_erbs']}</b> | Cells: <b>{meta['total_cells']}</b></span>
+                <span class="meta-chip">⏱️ Cell-Hours: <b>{meta['total_rops']:,} rows</b></span>
+                <span class="meta-chip">📡 EARFCN: <b>{', '.join(map(str, meta['carriers']))}</b></span>
+            </div>
+        </div>
         """,
         unsafe_allow_html=True,
     )
 
+with hdr_col_right:
+    # Prepare AMOS lookup for top degraded cells so PDF Export is instantaneous & complete
+    pdf_meta = {**meta, "view_mode": view_mode}
+    deg_for_pdf = active_filtered_df[active_filtered_df["Severity"].isin(["CRITICAL", "DEGRADED"])].head(15)
+    amos_map = {str(r["EUtranCell Id"]): generate_amos_script(r) for _, r in deg_for_pdf.iterrows()}
+    if st.session_state["selected_cell_id"]:
+        sel_match = active_scope_df[active_scope_df["EUtranCell Id"] == st.session_state["selected_cell_id"]]
+        if not sel_match.empty:
+            amos_map[st.session_state["selected_cell_id"]] = generate_amos_script(sel_match.iloc[0])
 
-# ============================================================================
-# 2. CACHED DATA INGESTION & CLIPBOARD / AUTO-DOWNLOAD WIDGETS
-# ============================================================================
-
-def render_html(markup: str) -> None:
-    """
-    Strip leading line indentation & empty lines before st.markdown so CommonMark
-    never misinterprets indented HTML tags as raw <pre><code> blocks.
-    """
-    compact = "\n".join(line.strip() for line in markup.splitlines() if line.strip())
-    st.markdown(compact, unsafe_allow_html=True)
-
-
-def format_amos_terminal_html(amos_script: str) -> str:
-    """Format AMOS/Moshell script lines into syntax-colored HTML without blank lines."""
-    out_lines: List[str] = []
-    for raw_line in amos_script.splitlines():
-        s = raw_line.strip()
-        if not s:
-            out_lines.append('<div class="amos-line">&nbsp;</div>')
-        elif s.startswith("#"):
-            out_lines.append(f'<div class="amos-line amos-cmt">{html.escape(raw_line)}</div>')
-        elif s.startswith("set "):
-            out_lines.append(f'<div class="amos-line amos-set">{html.escape(raw_line)}</div>')
-        elif s.startswith(("moshell ", "confb", "gs+", "gs-", "lt ", "cvms ", "cvls", "cvcu ")):
-            out_lines.append(f'<div class="amos-line amos-hdr">{html.escape(raw_line)}</div>')
-        else:
-            out_lines.append(f'<div class="amos-line">{html.escape(raw_line)}</div>')
-    return "".join(out_lines)
+    pdf_bytes = generate_diagnostic_pdf(
+        df_display=active_filtered_df if not active_filtered_df.empty else active_scope_df,
+        exec_metrics=exec_metrics,
+        meta=pdf_meta,
+        amos_lookup=amos_map,
+        selected_cell_id=st.session_state["selected_cell_id"],
+    )
+    st.download_button(
+        label="📥 Export Diagnostic PDF Report",
+        data=pdf_bytes,
+        file_name=f"LTE_RAN_Diagnostic_{view_mode.replace(' ', '_')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
 
 
-@st.cache_data(show_spinner=False)
-def load_cached_dump(file_bytes: bytes, file_name: str) -> AnalysisResult:
-    """Cache parsed KPIs, vector pivots, and RCA outputs across UI interactions."""
-    return analyze_counter_dump(file_bytes, filename=file_name)
+# ==============================================================================
+# 6. TIER 1 — EXECUTIVE METRIC BAR (6 KPI CARDS)
+# ==============================================================================
 
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-@st.cache_data(show_spinner=False)
-def load_default_dump(path_str: str, mtime: float) -> AnalysisResult:
-    """Load workspace Data/Counters.xlsx with mtime cache invalidation."""
-    _ = mtime
-    p = Path(path_str)
-    return analyze_counter_dump(p, filename=p.name)
+scope_unit = "Cells" if is_cell_view else "Cell-ROPs"
+cssr_delta = exec_metrics["sys_cssr_pct"] - 98.5
+cssr_cls = "crit" if exec_metrics["sys_cssr_pct"] < 97.0 else ("deg" if exec_metrics["sys_cssr_pct"] < 98.5 else "norm")
+dcr_cls = "crit" if exec_metrics["sys_dcr_pct"] > 1.0 else ("deg" if exec_metrics["sys_dcr_pct"] > 0.5 else "norm")
+hosr_cls = "crit" if exec_metrics["sys_hosr_pct"] < 95.0 else ("deg" if exec_metrics["sys_hosr_pct"] < 98.0 else "norm")
+worst_cls = "crit" if exec_metrics["critical_count"] > 0 else ("deg" if exec_metrics["degraded_count"] > 0 else "norm")
+vdcr_cls = "crit" if exec_metrics["sys_volte_dcr_pct"] > 0.8 else ("deg" if exec_metrics["sys_volte_dcr_pct"] > 0.3 else "norm")
 
-
-@st.cache_data(show_spinner=False)
-def load_static_file_bytes(path_str: str, mtime: float) -> bytes:
-    """Cache static reference files (Counters.xlsx template & Readme.pdf manual) with mtime invalidation."""
-    _ = mtime
-    return Path(path_str).read_bytes()
-
-
-def _render_iframe(markup: str, height: int) -> None:
-    """Embed HTML/JS widget using st.iframe (Streamlit >= 1.56) or components.html fallback."""
-    if hasattr(st, "iframe"):
-        st.iframe(markup, height=max(1, height))
-    else:
-        components.html(markup, height=height)
-
-
-def render_copy_button(text_to_copy: str, label: str, key_id: str, full_width: bool = True) -> None:
-    """Render a tactile dark-OLED One-Click Copy button backed by browser Clipboard API."""
-    payload = json.dumps(text_to_copy)
-    width_css = "100%" if full_width else "auto"
-    _render_iframe(
+with c1:
+    st.markdown(
         f"""
-        <div style="margin:0;padding:0;">
-          <button id="btn_{key_id}" onclick="copyCmd_{key_id}()" style="
-            width:{width_css};
-            background:linear-gradient(135deg,#0F172A 0%,#1E293B 100%);
-            color:#38BDF8;
-            border:1px solid rgba(56,189,248,0.45);
-            border-radius:6px;
-            padding:7px 12px;
-            font-family:'JetBrains Mono',Consolas,monospace;
-            font-size:12px;
-            font-weight:600;
-            cursor:pointer;
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            gap:8px;
-            transition:all 0.15s ease;">
-            <span>⌘</span> <span id="lbl_{key_id}">{html.escape(label)}</span>
-          </button>
+        <div class="kpi-card info">
+            <div class="kpi-label">Evaluated {scope_unit}</div>
+            <div class="kpi-value">{exec_metrics['total_evaluated']:,}</div>
+            <div class="kpi-sub">
+                <span style="color:#94A3B8;">STAT_INSIG Excluded:</span>
+                <span style="color:#CBD5E1;font-weight:700;">{exec_metrics['stat_insig']:,}</span>
+            </div>
         </div>
-        <script>
-        function copyCmd_{key_id}() {{
-            const txt = {payload};
-            const lbl = document.getElementById("lbl_{key_id}");
-            const btn = document.getElementById("btn_{key_id}");
-            const done = () => {{
-                lbl.innerText = "✓ COPIED TO CLIPBOARD";
-                btn.style.borderColor = "#52C41A";
-                btn.style.color = "#52C41A";
-                setTimeout(() => {{
-                    lbl.innerText = {json.dumps(label)};
-                    btn.style.borderColor = "rgba(56,189,248,0.45)";
-                    btn.style.color = "#38BDF8";
-                }}, 2000);
-            }};
-            if (navigator.clipboard && navigator.clipboard.writeText) {{
-                navigator.clipboard.writeText(txt).then(done).catch(() => fallbackCopy(txt, done));
-            }} else {{
-                fallbackCopy(txt, done);
-            }}
-        }}
-        function fallbackCopy(text, cb) {{
-            const ta = document.createElement("textarea");
-            ta.value = text;
-            document.body.appendChild(ta);
-            ta.select();
-            document.execCommand("copy");
-            document.body.removeChild(ta);
-            cb();
-        }}
-        </script>
         """,
-        height=40,
+        unsafe_allow_html=True,
     )
 
-
-def trigger_pdf_autodownload(pdf_bytes: bytes, download_name: str) -> None:
-    """Trigger immediate browser download of generated PDF bytes."""
-    b64 = base64.b64encode(pdf_bytes).decode("ascii")
-    _render_iframe(
+with c2:
+    st.markdown(
         f"""
-        <a id="auto_pdf_dl" href="data:application/pdf;base64,{b64}" download="{html.escape(download_name)}"></a>
-        <script>document.getElementById('auto_pdf_dl').click();</script>
+        <div class="kpi-card {worst_cls}">
+            <div class="kpi-label">Worst {scope_unit} Detected</div>
+            <div class="kpi-value" style="color:{'#FF4D4F' if exec_metrics['worst_count'] > 0 else '#52C41A'};">
+                {exec_metrics['worst_count']:,} <span style="font-size:0.95rem;color:#94A3B8;">({exec_metrics['worst_pct']:.1f}%)</span>
+            </div>
+            <div class="kpi-sub">
+                <span style="color:#FF4D4F;">CRIT: {exec_metrics['critical_count']}</span>
+                <span style="color:#FAAD14;">DEG: {exec_metrics['degraded_count']}</span>
+            </div>
+        </div>
         """,
-        height=1,
+        unsafe_allow_html=True,
     )
 
-
-# ============================================================================
-# 3. PLOTLY HIGH-DENSITY DARK OLED CHARTS
-# ============================================================================
-
-PLOTLY_FONT_MONO = "JetBrains Mono, Roboto Mono, Consolas, monospace"
-PLOTLY_FONT_SANS = "Inter, Space Grotesk, sans-serif"
-
-
-def build_rop_trend_chart(ts_df: pd.DataFrame, scope_label: str) -> go.Figure:
-    """Dual-axis ROP Time-Series Trendline: CSSR (%) vs DCR (%)."""
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    if ts_df.empty:
-        fig.update_layout(
-            paper_bgcolor="#151D2E",
-            plot_bgcolor="#0B0F19",
-            height=295,
-            annotations=[dict(text="No ROP time-series records in selection", showarrow=False, font=dict(color="#94A3B8"))],
-        )
-        return fig
-
-    fig.add_trace(
-        go.Scatter(
-            x=ts_df["ROP_Time"],
-            y=ts_df["CSSR"],
-            name="CSSR (%)",
-            mode="lines+markers",
-            line=dict(color="#38BDF8", width=2.4),
-            marker=dict(size=5, color="#38BDF8"),
-            hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>CSSR: <b>%{y:.2f}%</b><extra></extra>",
-        ),
-        secondary_y=False,
-    )
-
-    dcr_ovr = ts_df["DCR_Overall"] if "DCR_Overall" in ts_df.columns else ts_df["DCR"]
-    fig.add_trace(
-        go.Bar(
-            x=ts_df["ROP_Time"],
-            y=dcr_ovr,
-            name="Overall DCR (%)",
-            marker=dict(
-                color=np.where(dcr_ovr > 2.5, "rgba(255,77,79,0.58)", np.where(dcr_ovr > 1.0, "rgba(250,173,20,0.52)", "rgba(82,196,26,0.40)")),
-                line=dict(width=0),
-            ),
-            hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>Overall DCR: <b>%{y:.2f}%</b><extra></extra>",
-        ),
-        secondary_y=True,
-    )
-    if "DCR_eNB" in ts_df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=ts_df["ROP_Time"],
-                y=ts_df["DCR_eNB"],
-                name="eNB DCR (%)",
-                mode="lines",
-                line=dict(color="#FAAD14", width=1.6, dash="dot"),
-                hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>eNB DCR: <b>%{y:.2f}%</b><extra></extra>",
-            ),
-            secondary_y=True,
-        )
-
-    # Baseline Reference Lines
-    fig.add_hline(
-        y=98.5,
-        line_dash="dot",
-        line_color="#52C41A",
-        line_width=1.2,
-        annotation_text="CSSR Baseline 98.5%",
-        annotation_font=dict(size=10, color="#52C41A", family=PLOTLY_FONT_MONO),
-        annotation_position="bottom right",
-        secondary_y=False,
-    )
-    fig.add_hline(
-        y=1.0,
-        line_dash="dash",
-        line_color="#FAAD14",
-        line_width=1.1,
-        secondary_y=True,
-    )
-
-    c_min = max(0.0, float(ts_df["CSSR"].min()) - 0.6)
-    fig.update_layout(
-        title=dict(
-            text=f"ROP Telemetry Trendline — {scope_label}",
-            font=dict(family="Space Grotesk, sans-serif", size=13, color="#F8FAFC"),
-            x=0.01,
-            y=0.96,
-        ),
-        paper_bgcolor="#151D2E",
-        plot_bgcolor="#0B0F19",
-        font=dict(family=PLOTLY_FONT_MONO, size=11, color="#94A3B8"),
-        height=300,
-        margin=dict(l=48, r=48, t=38, b=34),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=0.99, font=dict(size=10.5)),
-        hovermode="x unified",
-        bargap=0.28,
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="#1E293B", zeroline=False)
-    fig.update_yaxes(
-        title_text="CSSR (%)",
-        range=[min(96.5, c_min), 100.15],
-        showgrid=True,
-        gridcolor="#1E293B",
-        secondary_y=False,
-    )
-    fig.update_yaxes(
-        title_text="DCR (%)",
-        showgrid=False,
-        rangemode="tozero",
-        secondary_y=True,
-    )
-    return fig
-
-
-def build_cqi_stacked_chart(df: pd.DataFrame) -> go.Figure:
-    """Stacked Bar Chart of CQI Modulation Quality Bands across Worst/Filtered Cells."""
-    fig = go.Figure()
-    sub = df[df["CQI_Samples"] > 0].copy()
-    if sub.empty:
-        fig.update_layout(
-            paper_bgcolor="#151D2E",
-            plot_bgcolor="#0B0F19",
-            height=300,
-            annotations=[dict(text="No CQI vector samples available in current filter", showarrow=False, font=dict(color="#94A3B8"))],
-        )
-        return fig
-
-    # Show up to 14 cells sorted by highest Low-CQI tail for maximum diagnostic signal
-    sub = sub.sort_values("Low_CQI_Ratio", ascending=False).head(14)
-
-    bands = [
-        ("QPSK • Low CQI (0–6)", "CQI_QPSK_Pct", "#FF4D4F"),
-        ("16-QAM • Fair (7–9)", "CQI_16QAM_Pct", "#FAAD14"),
-        ("64-QAM • Good (10–12)", "CQI_64QAM_Pct", "#38BDF8"),
-        ("256-QAM • Peak (13–15)", "CQI_256QAM_Pct", "#52C41A"),
-    ]
-    for label, col, color in bands:
-        fig.add_trace(
-            go.Bar(
-                x=sub["EUtranCellFDD"],
-                y=sub[col],
-                name=label,
-                marker_color=color,
-                hovertemplate=f"<b>%{{x}}</b><br>{label}: <b>%{{y:.1f}}%</b><extra></extra>",
-            )
-        )
-
-    fig.update_layout(
-        barmode="stack",
-        title=dict(
-            text="Radio Quality — Unified CQI Band Distribution (T1 + 256-QAM T2, Worst Low-CQI Cells)",
-            font=dict(family="Space Grotesk, sans-serif", size=13, color="#F8FAFC"),
-            x=0.01,
-            y=0.96,
-        ),
-        paper_bgcolor="#151D2E",
-        plot_bgcolor="#0B0F19",
-        font=dict(family=PLOTLY_FONT_MONO, size=10.5, color="#94A3B8"),
-        height=300,
-        margin=dict(l=46, r=18, t=38, b=68),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=0.99, font=dict(size=10)),
-        yaxis=dict(title="Share (%)", range=[0, 100], gridcolor="#1E293B"),
-        xaxis=dict(tickangle=-28, showgrid=False),
-    )
-    return fig
-
-
-def build_prb_spectrum_chart(cell_name: str, prb_values: List[float]) -> go.Figure:
-    """PRB 1..100 Uplink Interference Spectrum Profile (PIM / Narrowband Detector)."""
-    prb_idx = list(range(1, len(prb_values) + 1))
-    arr = np.array(prb_values, dtype=float)
-    bar_colors = np.where(arr > -108.0, "#FF4D4F", np.where(arr > -112.0, "#FAAD14", "#38BDF8"))
-
-    fig = go.Figure(
-        go.Bar(
-            x=prb_idx,
-            y=arr + 125.0,  # Offset from -125 dBm floor so bars rise upward cleanly
-            base=-125.0,
-            marker_color=bar_colors,
-            customdata=arr,
-            hovertemplate="<b>PRB %{x}</b><br>UL Noise: <b>%{customdata:.2f} dBm</b><extra></extra>",
-        )
-    )
-    fig.add_hline(
-        y=-110.0,
-        line_dash="dash",
-        line_color="#FF4D4F",
-        line_width=1.2,
-        annotation_text="Interference Limit (-110 dBm)",
-        annotation_font=dict(size=10, color="#FF4D4F", family=PLOTLY_FONT_MONO),
-    )
-    fig.update_layout(
-        title=dict(
-            text=f"UL PRB Interference Spectrum (PRB 1–{len(prb_values)}) — {cell_name}",
-            font=dict(family="Space Grotesk, sans-serif", size=13, color="#F8FAFC"),
-            x=0.01,
-            y=0.96,
-        ),
-        paper_bgcolor="#151D2E",
-        plot_bgcolor="#0B0F19",
-        font=dict(family=PLOTLY_FONT_MONO, size=10.5, color="#94A3B8"),
-        height=300,
-        margin=dict(l=52, r=18, t=38, b=36),
-        xaxis=dict(title="Physical Resource Block (PRB Index)", gridcolor="#1E293B"),
-        yaxis=dict(title="dBm / PRB", range=[-123, max(-102.0, float(arr.max()) + 2.0)], gridcolor="#1E293B"),
-    )
-    return fig
-
-
-def build_pareto_worst_chart(
-    df: pd.DataFrame, rank_metric: str, active_cross_cell: Optional[str]
-) -> go.Figure:
-    """Horizontal Pareto Bar Chart of Top 10 Worst Cells supporting click Cross-Filtering."""
-    metric_cfg = {
-        "Overall DCR (%)": ("DCR_Overall", "DCR_Denom", 30, "%", True),
-        "eNB DCR (%)": ("DCR_eNB", "DCR_Denom", 30, "%", True),
-        "Drops / Session Hr": ("DCR_Norm", "pmSessionTimeUe", 3600, "/hr", True),
-        "Lowest Intra-Freq HOSR (%)": ("Intra_HOSR", "Intra_HO_Denom", 20, "%", False),
-        "Lowest Inter-Freq HOSR (%)": ("Inter_HOSR", "Inter_HO_Denom", 20, "%", False),
-        "Lowest Combined HOSR (%)": ("HOSR", "HO_Denom", 20, "%", False),
-        "Low CQI (<7) Ratio (%)": ("Low_CQI_Ratio", "CQI_Samples", 100, "%", True),
-        "RACH OOC Ratio (%)": ("RACH_OOC_Ratio", "pmRaAttCbra", 100, "%", True),
-        "IRAT Ping-Pong (%)": ("IRAT_PingPong_Rate", "IRAT_Denom", 10, "%", True),
-        "Lowest CSSR (%)": ("CSSR", "CSSR_Denom", 30, "%", False),
-        "VoLTE DCR (%)": ("VoLTE_DCR", "VoLTE_DCR_Denom", 10, "%", True),
-        "Lowest VoLTE CSSR (%)": ("VoLTE_CSSR", "VoLTE_CSSR_Denom", 10, "%", False),
-    }
-    col, denom_col, min_d, unit, desc = metric_cfg[rank_metric]
-
-    valid_sub = df[df[denom_col] >= min_d].copy()
-    if valid_sub.empty:
-        valid_sub = df.copy()
-
-    top10 = valid_sub.sort_values(col, ascending=not desc).head(10).iloc[::-1]
-
-    fig = go.Figure()
-    if top10.empty:
-        fig.update_layout(paper_bgcolor="#151D2E", plot_bgcolor="#0B0F19", height=342)
-        return fig
-
-    colors_list = []
-    line_widths = []
-    for _, r in top10.iterrows():
-        c_name = str(r["EUtranCellFDD"])
-        is_sel = active_cross_cell == c_name
-        if r["Status"] == "CRITICAL":
-            base_c = "#FF4D4F" if (active_cross_cell is None or is_sel) else "rgba(255,77,79,0.35)"
-        elif r["Status"] == "DEGRADED":
-            base_c = "#FAAD14" if (active_cross_cell is None or is_sel) else "rgba(250,173,20,0.35)"
-        else:
-            base_c = "#38BDF8" if (active_cross_cell is None or is_sel) else "rgba(56,189,248,0.35)"
-        colors_list.append(base_c)
-        line_widths.append(2.0 if is_sel else 0.0)
-
-    fig.add_trace(
-        go.Bar(
-            x=top10[col],
-            y=top10["EUtranCellFDD"],
-            customdata=np.stack([top10["EUtranCellFDD"], top10["eNodeB_Name"], top10["Primary_Root_Cause"]], axis=-1),
-            orientation="h",
-            text=[f"{v:.2f}{unit}" for v in top10[col]],
-            textposition="auto",
-            textfont=dict(family=PLOTLY_FONT_MONO, size=10.5, color="#F8FAFC"),
-            marker=dict(
-                color=colors_list,
-                line=dict(color="#FFFFFF", width=line_widths),
-                cornerradius=4,
-            ),
-            hovertemplate=(
-                "<b>%{customdata[0]}</b> (%{customdata[1]})<br>"
-                f"{rank_metric}: <b>%{{x:.2f}}{unit}</b><br>"
-                "RCA: %{customdata[2]}<br>"
-                "<i>Click bar to cross-filter &amp; inspect</i><extra></extra>"
-            ),
-        )
-    )
-
-    fig.update_layout(
-        title=dict(
-            text=f"Top 10 Worst Cells — {rank_metric}",
-            font=dict(family="Space Grotesk, sans-serif", size=13, color="#F8FAFC"),
-            x=0.01,
-            y=0.97,
-        ),
-        paper_bgcolor="#151D2E",
-        plot_bgcolor="#0B0F19",
-        font=dict(family=PLOTLY_FONT_MONO, size=10.5, color="#CBD5E1"),
-        height=300,
-        margin=dict(l=142, r=18, t=36, b=30),
-        xaxis=dict(showgrid=True, gridcolor="#1E293B", zeroline=False),
-        yaxis=dict(showgrid=False, tickfont=dict(family=PLOTLY_FONT_MONO, size=10.5, color="#F1F5F9")),
-        clickmode="event+select",
-    )
-    return fig
-
-
-# ============================================================================
-# 4. SESSION STATE MANAGEMENT & FILTER ENGINE
-# ============================================================================
-
-def init_session_state() -> None:
-    defaults = {
-        "triage_preset": "All Degraded",
-        "sel_enodebs": [],
-        "sel_cells": [],
-        "sel_rca_cats": [],
-        "cross_filter_cell": None,
-        "inspected_cell": None,
-        "drawer_open": False,
-        "last_grid_sel": None,
-        "last_pareto_sel": None,
-        "pareto_metric": "Overall DCR (%)",
-        "pdf_cache_bytes": None,
-        "pdf_cache_name": "",
-        "pdf_cache_engine": "",
-        "filter_gen": 0,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-
-def reset_all_filters() -> None:
-    """Restore all sidebar presets, multi-selects, and chart cross-filters to default."""
-    st.session_state["triage_preset"] = "All Degraded"
-    st.session_state["sel_enodebs"] = []
-    st.session_state["sel_cells"] = []
-    st.session_state["sel_rca_cats"] = []
-    st.session_state["cross_filter_cell"] = None
-    st.session_state["filter_gen"] = st.session_state.get("filter_gen", 0) + 1
-
-
-def apply_filters(cell_df: pd.DataFrame) -> pd.DataFrame:
-    """Apply Quick Triage Preset + Granular Multi-Selects."""
-    df = cell_df.copy()
-    preset = st.session_state["triage_preset"]
-
-    if preset == "All Degraded":
-        df = df[df["Status"].isin(["CRITICAL", "DEGRADED"])]
-    elif preset == "Drop Call Spike (DCR > 1%)":
-        df = df[
-            (df["DCR_Denom"] >= 30)
-            & ((df["DCR_Overall"] > 1.0) | ((df["pmSessionTimeUe"] >= 3600) & (df["DCR_Norm"] > 10.0)))
-        ]
-    elif preset in ("Handover / RACH Issue (Intra/Inter HOSR)", "Handover / RACH Issue (HOSR < 95%)"):
-        df = df[
-            ((df["Intra_HO_Denom"] >= 20) & (df["Intra_HOSR"] < 96.0))
-            | ((df["Inter_HO_Denom"] >= 20) & (df["Inter_HOSR"] < 94.0))
-            | ((df["HO_Denom"] >= 20) & (df["HOSR"] < 95.0))
-            | ((df["CSSR_Denom"] >= 30) & (df["RACH_OOC_Ratio"] > 5.0))
-        ]
-    elif preset == "Accessibility Failure (CSSR < 97%)":
-        df = df[(df["CSSR_Denom"] >= 30) & (df["CSSR"] < 97.0)]
-    elif preset == "IRAT Ping-Pong Loop (> 5%)":
-        df = df[(df["IRAT_Denom"] >= 10) & (df["IRAT_PingPong_Rate"] > 5.0)]
-    elif preset == "Radio Quality / CQI Degraded":
-        df = df[(df["CQI_Samples"] >= 100) & ((df["Avg_CQI"] < 7.5) | (df["Low_CQI_Ratio"] > 30.0) | (df["UL_Intf_dBm"] > -110.0))]
-    elif preset == "VoLTE Degradation (QCI=1)":
-        has_q5 = bool(df["Has_QCI5"].any()) if "Has_QCI5" in df.columns else False
-        v_cssr_mask = (
-            (df["VoLTE_CSSR"] < 97.5) | (df["VoLTE_Bearer_SR"] < 98.0)
-            if has_q5
-            else (df["VoLTE_Bearer_SR"] < 98.0) | ((df["VoLTE_CSSR"] < 97.5) & (df["VoLTE_Bearer_SR"] < 99.5))
-        )
-        v_sess_col = df["pmSessionTimeDrbQci[1]"] if "pmSessionTimeDrbQci[1]" in df.columns else 0.0
-        v_dcr_mask = (df["VoLTE_DCR"] > 0.8) | ((v_sess_col >= 1800.0) & (df["VoLTE_DCR_Norm"] > 3.0))
-        df = df[
-            ((df["VoLTE_CSSR_Denom"] >= 10) & v_cssr_mask)
-            | ((df["VoLTE_DCR_Denom"] >= 10) & v_dcr_mask)
-        ]
-
-    if st.session_state["sel_enodebs"]:
-        df = df[df["eNodeB_Name"].isin(st.session_state["sel_enodebs"])]
-    if st.session_state["sel_cells"]:
-        df = df[df["EUtranCellFDD"].isin(st.session_state["sel_cells"])]
-    if st.session_state["sel_rca_cats"]:
-        df = df[df["RCA_Category"].isin(st.session_state["sel_rca_cats"])]
-
-    return df.reset_index(drop=True)
-
-
-def status_badge_html(status: str) -> str:
-    st_u = str(status).upper()
-    if st_u == "CRITICAL":
-        return '<span class="status-badge badge-critical">● CRITICAL</span>'
-    if st_u == "DEGRADED":
-        return '<span class="status-badge badge-degraded">▲ DEGRADED</span>'
-    if st_u == "NORMAL":
-        return '<span class="status-badge badge-normal">✓ NORMAL</span>'
-    return '<span class="status-badge badge-low">◌ LOW SAMPLE</span>'
-
-
-# ============================================================================
-# 5. MAIN COCKPIT APPLICATION
-# ============================================================================
-
-def main() -> None:
-    inject_cockpit_css()
-    init_session_state()
-
-    # ------------------------------------------------------------------
-    # COLLAPSIBLE SIDEBAR: DATA INGESTION & MULTI-TIER FILTERING
-    # ------------------------------------------------------------------
-    with st.sidebar:
-        render_html(
-            """
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-              <div style="width:34px;height:34px;border-radius:8px;background:#151D2E;border:1px solid #38BDF8;display:flex;align-items:center;justify-content:center;font-weight:700;color:#38BDF8;font-family:'JetBrains Mono',monospace;">E///</div>
-              <div>
-                <div style="font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:0.98rem;color:#F8FAFC;">RAN RCA COCKPIT</div>
-                <div style="font-size:0.70rem;color:#94A3B8;font-family:'JetBrains Mono',monospace;">ENM / AMOS Telemetry v8.4 &bull; 25.Q3</div>
-              </div>
+with c3:
+    st.markdown(
+        f"""
+        <div class="kpi-card {cssr_cls}">
+            <div class="kpi-label">System CSSR (%)</div>
+            <div class="kpi-value">{exec_metrics['sys_cssr_pct']:.2f}%</div>
+            <div class="kpi-sub">
+                <span style="color:#94A3B8;">vs 98.5% Target:</span>
+                <span style="color:{'#52C41A' if cssr_delta >= 0 else '#FF4D4F'};font-weight:700;">{cssr_delta:+.2f}%</span>
             </div>
-            """
-        )
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        st.markdown("##### 📥 PM Counter Ingestion")
-        uploaded_file = st.file_uploader(
-            "Drag & Drop ENM / AMOS Dump (.xlsx, .xls, .csv)",
-            type=["xlsx", "xls", "csv"],
-            help="Supports multi-sheet ENIQ/ENM dumps (Data / CSSR_DCR, CqiDistr, InterferencePwrPrb, VoLTE) and metadata header rows.",
-        )
+with c4:
+    dcr_badge_txt = "⚠ ALERT > 1.0%" if exec_metrics["sys_dcr_pct"] > 1.0 else ("✓ <= 0.50% Target" if exec_metrics["sys_dcr_pct"] <= 0.5 else "Watch (> 0.5%)")
+    dcr_badge_clr = "#FF4D4F" if exec_metrics["sys_dcr_pct"] > 1.0 else ("#52C41A" if exec_metrics["sys_dcr_pct"] <= 0.5 else "#FAAD14")
+    st.markdown(
+        f"""
+        <div class="kpi-card {dcr_cls}">
+            <div class="kpi-label">System Overall DCR (%)</div>
+            <div class="kpi-value">{exec_metrics['sys_dcr_pct']:.2f}%</div>
+            <div class="kpi-sub">
+                <span style="color:#94A3B8;">Baseline &le; 0.5%</span>
+                <span style="color:{dcr_badge_clr};font-weight:700;">{dcr_badge_txt}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        # Sample Counters.xlsx & Readme.pdf (25.Q3) Reference Downloads
-        if DEFAULT_DATASET_PATH.exists() or DEFAULT_README_PATH.exists():
-            st.markdown(
-                "<div style='font-size:0.73rem;color:#94A3B8;margin:4px 0 6px 0;font-weight:600;'>"
-                "📂 File mẫu &amp; Tài liệu hướng dẫn (25.Q3):</div>",
-                unsafe_allow_html=True,
-            )
-            dl_c1, dl_c2 = st.columns(2, gap="small")
-            with dl_c1:
-                if DEFAULT_DATASET_PATH.exists():
-                    sample_xlsx_bytes = load_static_file_bytes(
-                        str(DEFAULT_DATASET_PATH), DEFAULT_DATASET_PATH.stat().st_mtime
-                    )
-                    st.download_button(
-                        label="📥 Counters.xlsx",
-                        data=sample_xlsx_bytes,
-                        file_name="Counters.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        help="Tải file PM Counter mẫu chuẩn 4 sheets (Data, CqiDistr, InterferencePwrPrb, VoLTE)",
-                        key="dl_sample_counters_xlsx",
-                        width="stretch",
-                    )
-            with dl_c2:
-                if DEFAULT_README_PATH.exists():
-                    readme_pdf_bytes = load_static_file_bytes(
-                        str(DEFAULT_README_PATH), DEFAULT_README_PATH.stat().st_mtime
-                    )
-                    st.download_button(
-                        label="📘 Readme.pdf",
-                        data=readme_pdf_bytes,
-                        file_name="Readme.pdf",
-                        mime="application/pdf",
-                        help="Tải tài liệu kỹ thuật & cẩm nang vận hành LTE RAN Troubleshooting v8.4 (25.Q3)",
-                        key="dl_manual_readme_pdf",
-                        width="stretch",
-                    )
+with c5:
+    st.markdown(
+        f"""
+        <div class="kpi-card {hosr_cls}">
+            <div class="kpi-label">Combined HOSR (%)</div>
+            <div class="kpi-value">{exec_metrics['sys_hosr_pct']:.2f}%</div>
+            <div class="kpi-sub">
+                <span style="color:#94A3B8;">Intra + Inter Mobility</span>
+                <span style="color:#38BDF8;">Target &ge; 98.0%</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        # Load uploaded file or auto-ingest default Data/Counters.xlsx
-        try:
-            if uploaded_file is not None:
-                with st.spinner("Executing Vectorized ETL & RCA Decision Trees..."):
-                    result = load_cached_dump(uploaded_file.getvalue(), uploaded_file.name)
-            elif DEFAULT_DATASET_PATH.exists():
-                with st.spinner("Ingesting Data/Counters.xlsx..."):
-                    result = load_default_dump(
-                        str(DEFAULT_DATASET_PATH), DEFAULT_DATASET_PATH.stat().st_mtime
-                    )
-            else:
-                st.warning("Please upload an Ericsson ENM/AMOS CSV or Excel counter dump to begin.")
-                st.stop()
-        except Exception as exc:
-            st.error(f"Data Ingestion Error: {exc}")
-            st.stop()
+with c6:
+    st.markdown(
+        f"""
+        <div class="kpi-card {vdcr_cls}">
+            <div class="kpi-label">VoLTE QCI=1 DCR &amp; CQI</div>
+            <div class="kpi-value">{exec_metrics['sys_volte_dcr_pct']:.2f}%</div>
+            <div class="kpi-sub">
+                <span style="color:#94A3B8;">VoLTE CSSR: {exec_metrics['sys_volte_cssr_pct']:.2f}%</span>
+                <span style="color:#38BDF8;font-weight:700;">CQI: {exec_metrics['sys_avg_cqi']:.2f}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        full_df = result.cell_df
-        gen_key = st.session_state["filter_gen"]
+st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown("##### ⚡ Quick Triage Presets")
-        active_presets = list(TRIAGE_PRESETS)
-        if result.has_volte_counters:
-            active_presets.insert(-1, "VoLTE Degradation (QCI=1)")
-        if st.session_state["triage_preset"] not in active_presets:
-            st.session_state["triage_preset"] = "All Degraded"
-        selected_preset = st.radio(
-            "Diagnostic Preset",
-            options=active_presets,
-            index=active_presets.index(st.session_state["triage_preset"]),
-            key=f"radio_preset_{gen_key}",
-            label_visibility="collapsed",
-        )
-        if selected_preset != st.session_state["triage_preset"]:
-            st.session_state["triage_preset"] = selected_preset
-            st.session_state["cross_filter_cell"] = None
-            st.rerun()
 
-        st.markdown("##### 🎯 Granular Multi-Select")
-        all_enbs = sorted(full_df["eNodeB_Name"].unique().tolist())
-        sel_enbs = st.multiselect(
-            "eNodeB_Name (ERBS Id)",
-            options=all_enbs,
-            default=st.session_state["sel_enodebs"],
-            key=f"ms_enb_{gen_key}",
-            placeholder="All eNodeBs...",
-        )
-        st.session_state["sel_enodebs"] = sel_enbs
+# ==============================================================================
+# 7. TIER 2 — ANALYTICS & DIAGNOSTICS GRID (7 : 5 RATIO)
+# ==============================================================================
 
-        avail_cells_df = full_df[full_df["eNodeB_Name"].isin(sel_enbs)] if sel_enbs else full_df
-        all_cells = sorted(avail_cells_df["EUtranCellFDD"].unique().tolist())
-        sel_cells = st.multiselect(
-            "EUtranCellFDD",
-            options=all_cells,
-            default=[c for c in st.session_state["sel_cells"] if c in all_cells],
-            key=f"ms_cell_{gen_key}",
-            placeholder="Search EUtranCellFDD...",
-        )
-        st.session_state["sel_cells"] = sel_cells
+col_analytics, col_pareto = st.columns([7, 5], gap="medium")
 
-        present_cats = [c for c in full_df["RCA_Category"].unique().tolist() if c]
-        sel_cats = st.multiselect(
-            "Root Cause Group (RCA)",
-            options=sorted(present_cats),
-            default=[c for c in st.session_state["sel_rca_cats"] if c in present_cats],
-            key=f"ms_rca_{gen_key}",
-            placeholder="Filter by RCA Cause...",
-        )
-        st.session_state["sel_rca_cats"] = sel_cats
+# ------------------------------------------------------------------------------
+# RIGHT COLUMN FIRST LOGICALLY? No, render in exact columns; Pareto on_select updates session_state!
+# ------------------------------------------------------------------------------
+with col_pareto:
+    st.markdown(
+        "<div class='panel-hdr'>"
+        "<span>🎯 Pareto Top 10 Worst Cells (Click Bar to Cross-Filter)</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    pareto_metric_label = st.selectbox(
+        "Rank Worst Cells By",
+        options=[
+            "Overall DCR %",
+            "VoLTE DCR %",
+            "CSSR %",
+            "Intra-Freq HOSR %",
+            "Inter-Freq HOSR %",
+            "UL Interference dBm",
+            "IRAT Offload %",
+        ],
+        index=0,
+        label_visibility="collapsed",
+    )
 
-        st.markdown("")
-        if st.button("↺ Reset All Filters", width="stretch"):
-            reset_all_filters()
-            st.rerun()
+    pareto_cfg = {
+        "Overall DCR %": ("DCR_Overall_Pct", False, 1.0, 2.5, "%", cell_scoped[cell_scoped["DCR_Denom"] >= 30]),
+        "VoLTE DCR %": ("VoLTE_DCR_Rel_Pct", False, 0.8, 2.0, "%", cell_scoped[cell_scoped["VoLTE_DCR_Denom"] >= 10]),
+        "CSSR %": ("CSSR_Pct", True, 97.0, 95.0, "%", cell_scoped[cell_scoped["CSSR_Denom"] >= 30]),
+        "Intra-Freq HOSR %": ("Intra_Freq_HOSR_Pct", True, 96.0, 92.0, "%", cell_scoped[get_col(cell_scoped, "pmCellHoPrepAttLteIntraF") >= 20]),
+        "Inter-Freq HOSR %": ("Inter_Freq_HOSR_Pct", True, 94.0, 88.0, "%", cell_scoped[get_col(cell_scoped, "pmCellHoPrepAttLteInterF") >= 20]),
+        "UL Interference dBm": ("UL_Interf_Avg_dBm", False, -110.0, -108.0, " dBm", cell_scoped),
+        "IRAT Offload %": ("IRAT_Offload_Pct", False, 5.0, 10.0, "%", cell_scoped[get_col(cell_scoped, "pmRrcConnEstabSucc") >= 30]),
+    }
+    p_col, p_asc, p_deg_thr, p_crit_thr, p_unit, p_pool = pareto_cfg[pareto_metric_label]
+    p_valid = p_pool.dropna(subset=[p_col]).sort_values(p_col, ascending=p_asc).head(10).iloc[::-1]
 
-    # Apply sidebar filters
-    sidebar_filtered_df = apply_filters(full_df)
-
-    # Apply Pareto Cross-Filter on top for the Master Table if active
-    cross_cell = st.session_state.get("cross_filter_cell")
-    if cross_cell and cross_cell in full_df["EUtranCellFDD"].values:
-        grid_df = full_df[full_df["EUtranCellFDD"] == cross_cell].reset_index(drop=True)
+    if p_valid.empty:
+        st.info("No cells meet minimum sample denominator for the selected Pareto metric.")
     else:
-        grid_df = sidebar_filtered_df
-
-    # Ensure inspected_cell always points to a valid cell
-    if (
-        st.session_state["inspected_cell"] is None
-        or st.session_state["inspected_cell"] not in full_df["EUtranCellFDD"].values
-    ):
-        default_pool = grid_df if not grid_df.empty else full_df
-        st.session_state["inspected_cell"] = str(default_pool.iloc[0]["EUtranCellFDD"])
-
-    # Support URL query param ?inspect=1 or ?inspect=<EUtranCellFDD>
-    qp_inspect = st.query_params.get("inspect")
-    if qp_inspect and not st.session_state.get("_qp_applied"):
-        st.session_state["_qp_applied"] = True
-        if qp_inspect in full_df["EUtranCellFDD"].values:
-            st.session_state["inspected_cell"] = str(qp_inspect)
-        st.session_state["drawer_open"] = True
-
-    # ------------------------------------------------------------------
-    # TOP TELEMETRY HEADER
-    # ------------------------------------------------------------------
-    hdr_left, hdr_right = st.columns([9.2, 2.8], gap="small")
-    with hdr_left:
-        sheets_str = " + ".join(result.sheets_loaded)
-        render_html(
-            f"""
-            <div class="telemetry-bar">
-              <div class="telemetry-brand">
-                <svg width="38" height="38" viewBox="0 0 44 44" fill="none">
-                  <rect width="44" height="44" rx="9" fill="#0B0F19" stroke="#38BDF8" stroke-width="1.5"/>
-                  <path d="M11 14L33 9.5M11 24.5L33 20M11 35L33 30.5" stroke="#38BDF8" stroke-width="4" stroke-linecap="round"/>
-                  <circle cx="35" cy="9" r="3.2" fill="#FF4D4F"/>
-                </svg>
-                <div>
-                  <div class="telemetry-title">ERICSSON LTE RAN TELEMETRY &amp; AUTOMATED RCA COCKPIT</div>
-                  <div class="telemetry-sub">
-                    <span class="meta-chip">📂 {html.escape(result.source_name)}</span>
-                    <span class="meta-chip">🕒 ROP: {html.escape(result.data_start_time)} &rarr; {html.escape(result.data_end_time)}</span>
-                    <span class="meta-chip">📑 Sheets: {html.escape(sheets_str)}</span>
-                  </div>
-                </div>
-              </div>
-              <div class="fresh-pill">
-                <span class="pulse-dot"></span>
-                <span>DATA FRESHNESS: VERIFIED &bull; {result.total_rop_rows:,} ROPs</span>
-              </div>
-            </div>
-            """
-        )
-
-    with hdr_right:
-        if st.button("📄 Export Report to PDF", type="primary", width="stretch"):
-            with st.spinner("Compiling Branded HTML → PDF..."):
-                pdf_target = grid_df if not grid_df.empty else full_df
-                pdf_bytes, engine_used = export_report_to_pdf(result, pdf_target)
-                dl_name = f"Ericsson_RAN_RCA_{Path(result.source_name).stem}.pdf"
-                st.session_state["pdf_cache_bytes"] = pdf_bytes
-                st.session_state["pdf_cache_name"] = dl_name
-                st.session_state["pdf_cache_engine"] = engine_used
-                trigger_pdf_autodownload(pdf_bytes, dl_name)
-
-        if st.session_state.get("pdf_cache_bytes"):
-            st.download_button(
-                label=f"⬇ Save PDF ({st.session_state['pdf_cache_engine']})",
-                data=st.session_state["pdf_cache_bytes"],
-                file_name=st.session_state["pdf_cache_name"],
-                mime="application/pdf",
-                width="stretch",
-            )
-
-    for warn_msg in getattr(result, "data_warnings", []):
-        st.warning(f"⚠️ **Cảnh báo Toàn vẹn Dữ liệu ENIQ/BO:** {warn_msg}")
-
-    # ------------------------------------------------------------------
-    # TIER 1: EXECUTIVE METRIC BAR (4 COMPACT NOC CARDS)
-    # ------------------------------------------------------------------
-    total_cells = len(full_df)
-    total_enbs = full_df["eNodeB_Name"].nunique()
-    low_sample_cnt = int((full_df["Status"] == "LOW_SAMPLE").sum())
-
-    worst_mask = full_df["Status"].isin(["CRITICAL", "DEGRADED"])
-    worst_cnt = int(worst_mask.sum())
-    crit_cnt = int((full_df["Status"] == "CRITICAL").sum())
-    deg_cnt = int((full_df["Status"] == "DEGRADED").sum())
-    worst_pct = (worst_cnt / total_cells * 100.0) if total_cells > 0 else 0.0
-
-    valid_cssr_cells = full_df[full_df["CSSR_Denom"] >= 30]
-    avg_cssr = (
-        float(valid_cssr_cells["CSSR"].mean())
-        if not valid_cssr_cells.empty
-        else float(full_df["CSSR"].mean())
-    )
-    cssr_delta = avg_cssr - 98.5
-
-    valid_dcr_cells = full_df[full_df["DCR_Denom"] >= 30]
-    avg_dcr_ovr = (
-        float(valid_dcr_cells["DCR_Overall"].mean())
-        if not valid_dcr_cells.empty
-        else float(full_df["DCR_Overall"].mean())
-    )
-    avg_dcr_enb = (
-        float(valid_dcr_cells["DCR_eNB"].mean())
-        if not valid_dcr_cells.empty
-        else float(full_df["DCR_eNB"].mean())
-    )
-    avg_dcr_norm = float(full_df["DCR_Norm"].mean())
-
-    valid_vcssr_cells = full_df[full_df["VoLTE_CSSR_Denom"] >= 10]
-    avg_volte_cssr = (
-        float(valid_vcssr_cells["VoLTE_CSSR"].mean())
-        if not valid_vcssr_cells.empty
-        else float(full_df["VoLTE_CSSR"].mean())
-    )
-    valid_vdcr_cells = full_df[full_df["VoLTE_DCR_Denom"] >= 10]
-    avg_volte_dcr = (
-        float(valid_vdcr_cells["VoLTE_DCR"].mean())
-        if not valid_vdcr_cells.empty
-        else float(full_df["VoLTE_DCR"].mean())
-    )
-
-    valid_ho_cells = full_df[full_df["HO_Denom"] >= 20]
-    avg_hosr = (
-        float(valid_ho_cells["HOSR"].mean())
-        if not valid_ho_cells.empty
-        else float(full_df["HOSR"].mean())
-    )
-
-    c1, c2, c3, c4 = st.columns(4, gap="small")
-
-    with c1:
-        render_html(
-            f"""
-            <div class="kpi-card">
-              <div class="kpi-label">Total Evaluated Cells</div>
-              <div class="kpi-value-row">
-                <div class="kpi-value">{total_cells:,}</div>
-                <span class="status-badge badge-normal">{total_enbs} eNodeBs</span>
-              </div>
-              <div class="kpi-foot">
-                <span>Active Filter: <strong class="mono-num" style="color:#F8FAFC;">{len(grid_df)}</strong> cells</span>
-                <span class="mono-num">Low-Vol Excl: {low_sample_cnt}</span>
-              </div>
-            </div>
-            """
-        )
-
-    with c2:
-        w_cls = "card-crit" if crit_cnt > 0 else ("card-deg" if deg_cnt > 0 else "card-norm")
-        w_badge = (
-            f'<span class="status-badge badge-critical">{worst_pct:.1f}% OF RAN</span>'
-            if worst_cnt > 0
-            else '<span class="status-badge badge-normal">0.0% CLEAR</span>'
-        )
-        render_html(
-            f"""
-            <div class="kpi-card {w_cls}">
-              <div class="kpi-label">Worst Cells Detected</div>
-              <div class="kpi-value-row">
-                <div class="kpi-value" style="color:{'#FF4D4F' if crit_cnt > 0 else '#F8FAFC'};">{worst_cnt:,}</div>
-                {w_badge}
-              </div>
-              <div class="kpi-foot">
-                <span class="mono-num" style="color:#FF4D4F;">● CRIT: {crit_cnt}</span>
-                <span class="mono-num" style="color:#FAAD14;">▲ DEG: {deg_cnt}</span>
-              </div>
-            </div>
-            """
-        )
-
-    with c3:
-        cssr_card_cls = "card-norm" if avg_cssr >= 98.5 else ("card-deg" if avg_cssr >= 97.0 else "card-crit")
-        delta_badge_cls = "badge-normal" if cssr_delta >= 0 else ("badge-degraded" if avg_cssr >= 97.0 else "badge-critical")
-        c3_foot_left = (
-            f'<span class="mono-num" style="color:#38BDF8;">VoLTE SR: {avg_volte_cssr:.2f}%</span>'
-            if result.has_volte_counters
-            else "<span>RRC &times; S1-C &times; Init E-RAB</span>"
-        )
-        render_html(
-            f"""
-            <div class="kpi-card {cssr_card_cls}">
-              <div class="kpi-label">System Accessibility (Avg CSSR)</div>
-              <div class="kpi-value-row">
-                <div class="kpi-value">{avg_cssr:.2f}%</div>
-                <span class="status-badge {delta_badge_cls}">{cssr_delta:+.2f}% vs 98.5%</span>
-              </div>
-              <div class="kpi-foot">
-                {c3_foot_left}
-                <span class="mono-num">Comb HOSR: {avg_hosr:.2f}%</span>
-              </div>
-            </div>
-            """
-        )
-
-    with c4:
-        dcr_breach = avg_dcr_ovr > 1.0
-        dcr_card_cls = "card-crit" if avg_dcr_ovr > 2.5 else ("card-deg" if dcr_breach else "card-norm")
-        dcr_badge = (
-            '<span class="status-badge badge-critical">⚠ ALERT &gt; 1.0%</span>'
-            if dcr_breach
-            else '<span class="status-badge badge-normal">✓ &le; 1.0% OK</span>'
-        )
-        c4_foot_right = (
-            f'<span class="mono-num" style="color:{"#FAAD14" if avg_volte_dcr > 0.8 else "#38BDF8"};">VoLTE DCR: {avg_volte_dcr:.2f}%</span>'
-            if result.has_volte_counters
-            else f'<span class="mono-num">{avg_dcr_norm:.1f} drops/hr</span>'
-        )
-        render_html(
-            f"""
-            <div class="kpi-card {dcr_card_cls}">
-              <div class="kpi-label">System Retainability (Overall DCR)</div>
-              <div class="kpi-value-row">
-                <div class="kpi-value" style="color:{'#FF4D4F' if avg_dcr_ovr > 2.5 else ('#FAAD14' if dcr_breach else '#52C41A')};">{avg_dcr_ovr:.2f}%</div>
-                {dcr_badge}
-              </div>
-              <div class="kpi-foot">
-                <span class="mono-num">eNB DCR: {avg_dcr_enb:.2f}%</span>
-                {c4_foot_right}
-              </div>
-            </div>
-            """
-        )
-
-    st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
-
-    # ------------------------------------------------------------------
-    # TIER 2: ANALYTICS & DIAGNOSTICS GRID (7 : 5 RATIO)
-    # ------------------------------------------------------------------
-    col_analytics, col_pareto = st.columns([7, 5], gap="small")
-
-    with col_analytics:
-        render_html(
-            """
-            <div class="panel-header">
-              <span class="panel-title">📈 Radio Quality &amp; ROP Telemetry Diagnostics</span>
-              <span class="panel-hint">3GPP Multi-Dimensional View</span>
-            </div>
-            """
-        )
-        tab_names = ["🕒 ROP Trendline (CSSR vs DCR)", "📊 CQI Distribution Stacked Bar"]
-        if result.has_prb_spectrum:
-            tab_names.append("📡 UL PRB Interference Spectrum")
-
-        tabs = st.tabs(tab_names)
-
-        with tabs[0]:
-            if cross_cell:
-                ts_df = compute_rop_series(result.rop_trend_df, [cross_cell])
-                scope_lbl = f"Cell {cross_cell}"
-            elif len(sidebar_filtered_df) < len(full_df) and not sidebar_filtered_df.empty:
-                ts_df = compute_rop_series(
-                    result.rop_trend_df, sidebar_filtered_df["EUtranCellFDD"].tolist()
-                )
-                scope_lbl = f"Filtered Cohort ({len(sidebar_filtered_df)} Cells)"
+        bar_colors = []
+        for v, c_id in zip(p_valid[p_col], p_valid["EUtranCell Id"]):
+            if st.session_state["selected_cell_id"] == c_id:
+                bar_colors.append("#38BDF8")
+            elif (p_asc and v < p_crit_thr) or (not p_asc and v > p_crit_thr):
+                bar_colors.append("#FF4D4F")
+            elif (p_asc and v < p_deg_thr) or (not p_asc and v > p_deg_thr):
+                bar_colors.append("#FAAD14")
             else:
-                ts_df = compute_rop_series(result.rop_trend_df, None)
-                scope_lbl = f"Network Aggregate ({total_cells} Cells)"
+                bar_colors.append("#52C41A")
 
-            st.plotly_chart(
-                build_rop_trend_chart(ts_df, scope_lbl),
-                width="stretch",
-                config={"displayModeBar": False},
+        fig_pareto = go.Figure(
+            go.Bar(
+                x=p_valid[p_col],
+                y=p_valid["EUtranCell Id"],
+                orientation="h",
+                marker=dict(color=bar_colors, line=dict(color="#0B0F19", width=1)),
+                text=[f"{v:.2f}{p_unit}" for v in p_valid[p_col]],
+                textposition="auto",
+                customdata=np.stack([p_valid["EUtranCell Id"], p_valid["ERBS Id"], p_valid["Root_Cause"]], axis=-1),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b> (eNB: %{customdata[1]})<br>"
+                    f"{pareto_metric_label}: <b>%{{x:.2f}}{p_unit}</b><br>"
+                    "RCA: %{customdata[2]}<extra></extra>"
+                ),
             )
-
-        with tabs[1]:
-            cqi_source = grid_df if not grid_df.empty else full_df
-            st.plotly_chart(
-                build_cqi_stacked_chart(cqi_source),
-                width="stretch",
-                config={"displayModeBar": False},
-            )
-
-        if result.has_prb_spectrum and len(tabs) > 2:
-            with tabs[2]:
-                target_prb_cell = st.session_state["inspected_cell"]
-                prb_vals = result.prb_cell_map.get(target_prb_cell, [])
-                if prb_vals:
-                    st.plotly_chart(
-                        build_prb_spectrum_chart(target_prb_cell, prb_vals),
-                        width="stretch",
-                        config={"displayModeBar": False},
-                    )
-                else:
-                    st.info("Select a cell with PRB interference measurements to inspect PRB 1–100 noise floor.")
-
-    with col_pareto:
-        render_html(
-            """
-            <div class="panel-header">
-              <span class="panel-title">🔥 Top 10 Worst Cells Pareto</span>
-              <span class="panel-hint">Click bar to Cross-Filter &amp; Slide-Over</span>
-            </div>
-            """
         )
-        p_col1, p_col2 = st.columns([7.5, 4.5], gap="small")
-        with p_col1:
-            pareto_options = [
-                "Overall DCR (%)",
-                "eNB DCR (%)",
-                "Drops / Session Hr",
-                "Lowest Intra-Freq HOSR (%)",
-                "Lowest Inter-Freq HOSR (%)",
-                "Lowest Combined HOSR (%)",
-                "Low CQI (<7) Ratio (%)",
-                "RACH OOC Ratio (%)",
-                "Lowest CSSR (%)",
-                "IRAT Ping-Pong (%)",
-            ]
-            if result.has_volte_counters:
-                pareto_options.extend(["VoLTE DCR (%)", "Lowest VoLTE CSSR (%)"])
-            if st.session_state["pareto_metric"] not in pareto_options:
-                st.session_state["pareto_metric"] = pareto_options[0]
-            rank_by = st.selectbox(
-                "Rank Pareto By",
-                options=pareto_options,
-                index=pareto_options.index(st.session_state["pareto_metric"]),
-                label_visibility="collapsed",
-            )
-            st.session_state["pareto_metric"] = rank_by
-        with p_col2:
-            if cross_cell:
-                if st.button(f"✕ Clear: {cross_cell[:13]}", width="stretch"):
-                    st.session_state["cross_filter_cell"] = None
-                    st.rerun()
-            else:
-                st.markdown(
-                    "<div style='padding-top:7px;font-size:0.72rem;color:#64748B;text-align:right;' class='mono-num'>Cross-Filter: Ready</div>",
-                    unsafe_allow_html=True,
-                )
+        base_plotly_layout(fig_pareto, height=345)
+        if p_asc:
+            min_v = float(p_valid[p_col].min())
+            fig_pareto.update_xaxes(range=[max(0.0, min_v - 5.0), 100.5], title_text=pareto_metric_label)
+        elif pareto_metric_label == "UL Interference dBm":
+            # For negative dBm values, anchor base at -122 dBm so louder interference bars extend rightward!
+            vals_shift = p_valid[p_col] - (-122.0)
+            fig_pareto.data[0].x = vals_shift
+            fig_pareto.data[0].base = -122.0
+            fig_pareto.update_xaxes(range=[-122.0, max(float(p_valid[p_col].max()) + 2.5, -106.0)], title_text="UL Noise Floor (dBm)")
+        else:
+            fig_pareto.update_xaxes(title_text=pareto_metric_label)
 
-        pareto_pool = sidebar_filtered_df if not sidebar_filtered_df.empty else full_df
-        pareto_fig = build_pareto_worst_chart(pareto_pool, rank_by, cross_cell)
         pareto_event = st.plotly_chart(
-            pareto_fig,
-            width="stretch",
-            key=f"pareto_chart_{gen_key}_{rank_by}",
+            fig_pareto,
+            use_container_width=True,
             on_select="rerun",
             selection_mode="points",
-            config={"displayModeBar": False},
+            key="pareto_selector",
         )
+        if pareto_event and pareto_event.selection and pareto_event.selection.points:
+            pt = pareto_event.selection.points[0]
+            clicked_cell = pt.get("y") or (pt.get("customdata")[0] if pt.get("customdata") else None)
+            if clicked_cell and clicked_cell != st.session_state.get("_last_pareto_cell"):
+                st.session_state["_last_pareto_cell"] = clicked_cell
+                st.session_state["selected_cell_id"] = str(clicked_cell)
+        elif pareto_event and pareto_event.selection and not pareto_event.selection.points:
+            st.session_state["_last_pareto_cell"] = None
 
-        # Handle Pareto Bar Click -> Cross-Filter Master Grid & Open Slide-Over Drawer
-        sel_points = (
-            pareto_event.get("selection", {}).get("points", [])
-            if isinstance(pareto_event, dict)
-            else getattr(getattr(pareto_event, "selection", None), "points", [])
-        )
-        pareto_sig = (gen_key, rank_by, sel_points[0].get("y") if sel_points else None)
-        if pareto_sig != st.session_state.get("last_pareto_sel"):
-            st.session_state["last_pareto_sel"] = pareto_sig
-            if sel_points and sel_points[0].get("y"):
-                clicked_y = str(sel_points[0].get("y"))
-                st.session_state["cross_filter_cell"] = clicked_y
-                st.session_state["inspected_cell"] = clicked_y
-                st.session_state["drawer_open"] = True
-                st.rerun()
 
-    render_html("<div style='height:6px;'></div>")
+with col_analytics:
+    st.markdown(
+        "<div class='panel-hdr'>"
+        "<span>📈 Multi-Domain RAN Telemetry &amp; Radio Distribution</span>"
+        f"<span class='mono-num' style='font-size:0.75rem;color:#38BDF8;'>"
+        f"{'Cell Focus: ' + st.session_state['selected_cell_id'] if st.session_state['selected_cell_id'] else 'Network Scope'}"
+        "</span></div>",
+        unsafe_allow_html=True,
+    )
+    tab_trend, tab_cqi, tab_carrier = st.tabs([
+        "⏱️ Hourly Trendline",
+        "📶 Unified CQI & MIMO Distribution",
+        "📡 Carrier Layer Breakdown",
+    ])
 
-    # ------------------------------------------------------------------
-    # TIER 3: DATA-DENSE MASTER GRID & OFF-CANVAS SLIDE-OVER INSPECTOR
-    # ------------------------------------------------------------------
-    tb1, tb2, tb3, tb4 = st.columns([4.6, 3.2, 2.4, 1.8], gap="small")
-    with tb1:
-        filter_tag = (
-            f"Cross-Filtered: {cross_cell}"
-            if cross_cell
-            else f"{st.session_state['triage_preset']} ({len(grid_df)} cells)"
-        )
-        render_html(
-            f"""
-            <div class="panel-header" style="margin-bottom:4px;">
-              <span class="panel-title">🗂 Worst Cells Master Telemetry Grid</span>
-              <span class="panel-hint">{html.escape(filter_tag)}</span>
-            </div>
-            """
-        )
+    # ---- TAB 1: HOURLY TRENDLINE ----
+    with tab_trend:
+        t_ctrl1, t_ctrl2 = st.columns([5, 5])
+        with t_ctrl1:
+            trend_domain = st.radio(
+                "Trend Pair",
+                options=["MBB: CSSR (%) vs Overall DCR (%)", "VoLTE: QCI=1 CSSR (%) vs VoLTE DCR (%)"],
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+        with t_ctrl2:
+            use_cell_trend = st.checkbox(
+                f"Scope Trend to Selected Cell ({st.session_state['selected_cell_id'] or 'None'})",
+                value=bool(st.session_state["selected_cell_id"]),
+                disabled=not bool(st.session_state["selected_cell_id"]),
+            )
 
-    with tb2:
-        # Quick [Diagnose] Cell Selector synced with row click & Pareto click
-        selector_pool = (
-            grid_df["EUtranCellFDD"].tolist()
-            if not grid_df.empty
-            else full_df["EUtranCellFDD"].tolist()
+        trend_src = (
+            hourly_scoped[hourly_scoped["EUtranCell Id"] == st.session_state["selected_cell_id"]]
+            if (use_cell_trend and st.session_state["selected_cell_id"])
+            else hourly_scoped
         )
-        if st.session_state["inspected_cell"] not in selector_pool and selector_pool:
-            selector_idx = 0
+        if trend_src.empty:
+            st.info("No hourly records in current filter scope.")
         else:
-            selector_idx = (
-                selector_pool.index(st.session_state["inspected_cell"])
-                if selector_pool
-                else 0
-            )
+            # Counter-weighted hourly aggregation
+            grp = trend_src.groupby("ROP_Time", as_index=False).agg(
+                rrc_suc=("pmRrcConnEstabSucc", "sum"),
+                rrc_att=("pmRrcConnEstabAtt", "sum"),
+                rrc_reatt=("pmRrcConnEstabAttReatt", "sum"),
+                s1_suc=("pmS1SigConnEstabSucc", "sum"),
+                s1_att=("pmS1SigConnEstabAtt", "sum"),
+                erab_suc=("pmErabEstabSuccInit", "sum"),
+                erab_att=("pmErabEstabAttInit", "sum"),
+                dcr_num=("Active_Drops", "sum"),
+                dcr_den=("DCR_Denom", "sum"),
+                v_suc=("pmErabEstabSuccAddedQci", "sum"),
+                v_att=("VoLTE_CSSR_Denom", "sum"),
+                vd_num=("VoLTE_Active_Drops", "sum"),
+                vd_den=("VoLTE_DCR_Denom", "sum"),
+            ).sort_values("ROP_Time")
 
-        chosen_diag = st.selectbox(
-            "[Diagnose] Target Cell",
-            options=selector_pool if selector_pool else ["NONE"],
-            index=selector_idx,
-            format_func=lambda x: f"🔍 [Diagnose] {x}",
-            label_visibility="collapsed",
-        )
-        if chosen_diag != "NONE" and chosen_diag != st.session_state["inspected_cell"]:
-            st.session_state["inspected_cell"] = chosen_diag
-            st.session_state["drawer_open"] = True
-            st.rerun()
+            fig_trend = make_subplots(specs=[[{"secondary_y": True}]])
+            if trend_domain.startswith("MBB"):
+                y1 = (
+                    safe_div(grp["rrc_suc"], grp["rrc_att"] - grp["rrc_reatt"])
+                    * safe_div(grp["s1_suc"], grp["s1_att"])
+                    * safe_div(grp["erab_suc"], grp["erab_att"])
+                    * 100.0
+                ).round(2)
+                y2 = safe_div(grp["dcr_num"], grp["dcr_den"], 100.0).round(2)
+                y1_name, y2_name = "CSSR (%)", "Overall DCR (%)"
+                y1_thr, y2_thr = 98.5, 1.0
+            else:
+                y1 = safe_div(grp["v_suc"], grp["v_att"], 100.0).round(2)
+                y2 = safe_div(grp["vd_num"], grp["vd_den"], 100.0).round(2)
+                y1_name, y2_name = "VoLTE QCI=1 CSSR (%)", "VoLTE QCI=1 DCR (%)"
+                y1_thr, y2_thr = 99.0, 0.8
 
-    with tb3:
-        # Consolidated "Copy All Commands" for currently filtered degraded cells
-        degraded_in_view = (
-            grid_df[grid_df["Status"].isin(["CRITICAL", "DEGRADED"])]
-            if not grid_df.empty
-            else full_df[full_df["Status"].isin(["CRITICAL", "DEGRADED"])]
-        )
-        batch_amos = "\n\n".join(degraded_in_view.head(25)["AMOS_Script"].tolist())
-        if not batch_amos:
-            batch_amos = "# No degraded cells requiring AMOS remediation in current filter."
-        render_copy_button(
-            batch_amos,
-            f"Copy All AMOS ({min(25, len(degraded_in_view))})",
-            key_id="batch_amos_top",
-        )
-
-    with tb4:
-        drawer_lbl = "⇥ Close Slide-Over" if st.session_state["drawer_open"] else "⇤ Slide-Over Inspector"
-        if st.button(drawer_lbl, width="stretch"):
-            st.session_state["drawer_open"] = not st.session_state["drawer_open"]
-            st.rerun()
-
-    # Full-Width Master Interactive Grid
-    if grid_df.empty:
-        st.info(
-            "No cells match the active filter criteria (e.g., 0 cells breached this specific threshold in the current dataset). "
-            "Switch Quick Triage Preset or click 'Reset All Filters' in the sidebar."
-        )
-    else:
-        status_icons = {
-            "CRITICAL": "🔴 CRITICAL",
-            "DEGRADED": "🟠 DEGRADED",
-            "NORMAL": "🟢 NORMAL",
-            "LOW_SAMPLE": "⚪ LOW_SAMPLE",
-        }
-        grid_cols_data = {
-            "Action": ["[Diagnose] ▸"] * len(grid_df),
-            "Status": grid_df["Status"].map(status_icons).fillna(grid_df["Status"]),
-            "eNodeB_Name": grid_df["eNodeB_Name"],
-            "EUtranCellFDD": grid_df["EUtranCellFDD"],
-            "CSSR (%)": grid_df["CSSR"].round(2),
-            "Overall DCR (%)": grid_df["DCR_Overall"].round(2),
-            "eNB DCR (%)": grid_df["DCR_eNB"].round(2),
-            "Intra HOSR (%)": np.where(grid_df["Intra_HO_Denom"] > 0, grid_df["Intra_HOSR"].round(2), np.nan),
-            "Inter HOSR (%)": np.where(grid_df["Inter_HO_Denom"] > 0, grid_df["Inter_HOSR"].round(2), np.nan),
-            "Comb HOSR (%)": np.where(grid_df["HO_Denom"] > 0, grid_df["HOSR"].round(2), np.nan),
-            "Avg CQI": grid_df["Avg_CQI"].round(2),
-            "UL Intf (dBm)": grid_df["UL_Intf_dBm"].round(1),
-            "IRAT PP (%)": grid_df["IRAT_PingPong_Rate"].round(2),
-        }
-        if result.has_volte_counters:
-            grid_cols_data["VoLTE CSSR (%)"] = grid_df["VoLTE_CSSR"].round(2)
-            grid_cols_data["VoLTE DCR (%)"] = grid_df["VoLTE_DCR"].round(2)
-        grid_cols_data["RCA Type"] = grid_df["RCA_Category"]
-        grid_cols_data["Phase"] = grid_df["Isolated_Phase"]
-        grid_cols_data["Root Cause Diagnosis"] = grid_df["Primary_Root_Cause"]
-        grid_cols_data["Confidence"] = grid_df["Confidence_Score"]
-        display_df = pd.DataFrame(grid_cols_data)
-
-        grid_event = st.dataframe(
-            display_df,
-            width="stretch",
-            height=470,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key=f"master_grid_{gen_key}_{cross_cell}_{st.session_state['triage_preset']}",
-            column_config={
-                "Action": st.column_config.TextColumn("Inspect", width="small"),
-                "Status": st.column_config.TextColumn("Severity", width="small"),
-                "eNodeB_Name": st.column_config.TextColumn("eNodeB_Name", width="medium"),
-                "EUtranCellFDD": st.column_config.TextColumn("EUtranCellFDD", width="medium"),
-                "CSSR (%)": st.column_config.NumberColumn("CSSR %", format="%.2f%%"),
-                "Overall DCR (%)": st.column_config.NumberColumn("Overall DCR %", format="%.2f%%"),
-                "eNB DCR (%)": st.column_config.NumberColumn("eNB DCR %", format="%.2f%%"),
-                "Intra HOSR (%)": st.column_config.NumberColumn("Intra HOSR %", format="%.2f%%"),
-                "Inter HOSR (%)": st.column_config.NumberColumn("Inter HOSR %", format="%.2f%%"),
-                "Comb HOSR (%)": st.column_config.NumberColumn("Comb HOSR %", format="%.2f%%"),
-                "Avg CQI": st.column_config.NumberColumn("Avg CQI", format="%.2f"),
-                "UL Intf (dBm)": st.column_config.NumberColumn("UL Noise", format="%.1f dBm"),
-                "IRAT PP (%)": st.column_config.NumberColumn("IRAT PP", format="%.2f%%"),
-                "VoLTE CSSR (%)": st.column_config.NumberColumn("VoLTE CSSR", format="%.2f%%"),
-                "VoLTE DCR (%)": st.column_config.NumberColumn("VoLTE DCR", format="%.2f%%"),
-                "RCA Type": st.column_config.TextColumn("RCA Category", width="medium"),
-                "Phase": st.column_config.TextColumn("Isolated Phase", width="medium"),
-                "Root Cause Diagnosis": st.column_config.TextColumn("Primary Root Cause", width="large"),
-                "Confidence": st.column_config.ProgressColumn(
-                    "Confidence",
-                    format="%d%%",
-                    min_value=0,
-                    max_value=100,
+            fig_trend.add_trace(
+                go.Scatter(
+                    x=grp["ROP_Time"],
+                    y=y1,
+                    name=y1_name,
+                    mode="lines+markers",
+                    line=dict(color="#38BDF8", width=2.4),
+                    marker=dict(size=5),
                 ),
-            },
+                secondary_y=False,
+            )
+            fig_trend.add_trace(
+                go.Bar(
+                    x=grp["ROP_Time"],
+                    y=y2,
+                    name=y2_name,
+                    marker=dict(color="rgba(255, 77, 79, 0.55)", line=dict(color="#FF4D4F", width=1)),
+                ),
+                secondary_y=True,
+            )
+            fig_trend.add_hline(y=y2_thr, line_dash="dot", line_color="#FAAD14", secondary_y=True, annotation_text=f"Degraded ({y2_thr}%)")
+            base_plotly_layout(fig_trend, height=295)
+            fig_trend.update_yaxes(title_text=y1_name, secondary_y=False)
+            fig_trend.update_yaxes(title_text=y2_name, secondary_y=True, showgrid=False)
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+    # ---- TAB 2: UNIFIED CQI & MIMO DISTRIBUTION ----
+    with tab_cqi:
+        cqi_src = (
+            active_scope_df[active_scope_df["EUtranCell Id"] == st.session_state["selected_cell_id"]]
+            if st.session_state["selected_cell_id"] and not active_scope_df[active_scope_df["EUtranCell Id"] == st.session_state["selected_cell_id"]].empty
+            else active_scope_df
         )
+        bin_cols = [f"CQI_Bin_{i}" for i in range(16) if f"CQI_Bin_{i}" in cqi_src.columns]
+        if len(bin_cols) == 16 and not cqi_src.empty:
+            sums = cqi_src[bin_cols].sum()
+            tot_samples = max(float(sums.sum()), 1.0)
+            pcts = (sums / tot_samples * 100.0).values
+            labels = ["Bin 0 (OOR)"] + [f"CQI {i}" for i in range(1, 16)]
+            colors_cqi = ["#FF4D4F"] + ["#FAAD14"] * 6 + ["#38BDF8"] * 5 + ["#52C41A"] * 4
 
-        sel_rows = (
-            grid_event.get("selection", {}).get("rows", [])
-            if isinstance(grid_event, dict)
-            else getattr(getattr(grid_event, "selection", None), "rows", [])
-        )
-        grid_sig = (gen_key, cross_cell, st.session_state["triage_preset"], tuple(sel_rows))
-        if grid_sig != st.session_state.get("last_grid_sel"):
-            st.session_state["last_grid_sel"] = grid_sig
-            if sel_rows:
-                row_idx = sel_rows[0]
-                if 0 <= row_idx < len(grid_df):
-                    picked_cell = str(grid_df.iloc[row_idx]["EUtranCellFDD"])
-                    st.session_state["inspected_cell"] = picked_cell
-                    st.session_state["drawer_open"] = True
-                    st.rerun()
+            w_avg_cqi = float(get_col(cqi_src, "CQI_Weighted_Sum").sum() / max(get_col(cqi_src, "CQI_Valid_Samples").sum(), 1.0))
+            hom_pct = float(get_col(cqi_src, "Hom_256QAM_Samples").sum() / tot_samples * 100.0)
+            r1_pct = float(get_col(cqi_src, "Rank1_Samples").sum() / max(get_col(cqi_src, "Rank_Total_Samples").sum(), 1.0) * 100.0)
+            oor_pct = float(pcts[0])
 
-    # ------------------------------------------------------------------
-    # OFF-CANVAS FIXED SLIDE-OVER DIAGNOSTIC & AMOS TERMINAL DRAWER
-    # ------------------------------------------------------------------
-    if st.session_state["drawer_open"]:
-        with st.container(key="slide_over_drawer"):
-            active_cell_name = st.session_state["inspected_cell"]
-            cell_matches = full_df[full_df["EUtranCellFDD"] == active_cell_name]
-            cell_row = cell_matches.iloc[0] if not cell_matches.empty else full_df.iloc[0]
+            st.markdown(
+                f"<div class='telemetry-meta' style='margin-bottom:6px;'>"
+                f"<span class='meta-chip'>Avg CQI (1..15): <b>{w_avg_cqi:.2f}</b></span>"
+                f"<span class='meta-chip'>CQI OOR (Bin 0): <b style='color:{'#FF4D4F' if oor_pct > 5 else '#52C41A'};'>{oor_pct:.2f}%</b></span>"
+                f"<span class='meta-chip'>256-QAM Share: <b>{hom_pct:.1f}%</b></span>"
+                f"<span class='meta-chip'>MIMO Rank-1 Ratio: <b style='color:{'#FAAD14' if r1_pct > 75 else '#38BDF8'};'>{r1_pct:.1f}%</b></span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-            top_d1, top_d2 = st.columns([8.2, 3.8], gap="small")
-            with top_d1:
-                render_html(
-                    """
-                    <div style="padding-top:5px;font-family:'JetBrains Mono',monospace;font-size:0.72rem;letter-spacing:0.08em;color:#38BDF8;font-weight:700;">
-                      ⚡ OFF-CANVAS CELL INSPECTOR &bull; RCA EVIDENCE
-                    </div>
-                    """
+            fig_cqi = go.Figure(
+                go.Bar(
+                    x=labels,
+                    y=pcts,
+                    marker=dict(color=colors_cqi),
+                    text=[f"{p:.1f}%" for p in pcts],
+                    textposition="outside",
+                    hovertemplate="<b>%{x}</b>: %{y:.2f}% of reports<extra></extra>",
                 )
-            with top_d2:
-                if st.button("✕ Close Drawer", key="btn_close_slide_over", width="stretch"):
-                    st.session_state["drawer_open"] = False
-                    st.rerun()
-
-            st_val = str(cell_row["Status"])
-            conf_val = int(cell_row["Confidence_Score"])
-            cqi_str = f"{cell_row['Avg_CQI']:.2f}" if pd.notna(cell_row["Avg_CQI"]) else "N/A"
-            intf_str = f"{cell_row['UL_Intf_dBm']:.1f}" if pd.notna(cell_row["UL_Intf_dBm"]) else "N/A"
-
-            ev_rows_html = "".join(
-                f"<tr>"
-                f"<td class='mono'>{html.escape(str(ev['Counter / Indicator']))}</td>"
-                f"<td class='mono' style='color:#38BDF8;font-weight:600;'>{html.escape(str(ev['Value']))}</td>"
-                f"<td style='color:#94A3B8;'>{html.escape(str(ev['Meaning']))}</td>"
-                f"</tr>"
-                for ev in cell_row["Diagnostic_Evidence"]
             )
+            base_plotly_layout(fig_cqi, height=285)
+            fig_cqi.update_yaxes(title_text="Share of Reports (%)", range=[0, max(float(pcts.max()) * 1.22, 10.0)])
+            st.plotly_chart(fig_cqi, use_container_width=True)
+        else:
+            st.info("CQI Bin 0..15 distribution columns are not available in this dataset.")
 
-            secondary_html = (
-                f"<div style='margin-top:5px;color:#FAAD14;font-size:0.75rem;'>"
-                f"<strong>Secondary Triggers:</strong> {html.escape(str(cell_row['Secondary_Causes']))}</div>"
-                if cell_row["Secondary_Causes"] not in ("None", "")
-                else ""
-            )
+    # ---- TAB 3: CARRIER LAYER BREAKDOWN ----
+    with tab_carrier:
+        if "earfcndl" in active_scope_df.columns and not active_scope_df.empty:
+            rows_car = []
+            for earfcn, sub in active_scope_df.groupby("earfcndl"):
+                em = compute_executive_metrics(sub)
+                irat_r = float(safe_div(get_col(sub, "IRAT_Events").sum(), get_col(sub, "pmRrcConnEstabSucc").sum(), 100.0))
+                rows_car.append({
+                    "Carrier": f"EARFCN {int(earfcn)}",
+                    "Cells/ROPs": len(sub),
+                    "CSSR %": em["sys_cssr_pct"],
+                    "Combined HOSR %": em["sys_hosr_pct"],
+                    "VoLTE CSSR %": em["sys_volte_cssr_pct"],
+                    "Overall DCR %": em["sys_dcr_pct"],
+                    "VoLTE DCR %": em["sys_volte_dcr_pct"],
+                    "IRAT Offload %": round(irat_r, 2) if pd.notna(irat_r) else 0.0,
+                    "Avg CQI": em["sys_avg_cqi"],
+                })
+            df_car = pd.DataFrame(rows_car)
 
-            amos_text = str(cell_row["AMOS_Script"])
-            amos_lines_html = format_amos_terminal_html(amos_text)
+            fig_car = make_subplots(specs=[[{"secondary_y": True}]])
+            for m_col, clr in [("CSSR %", "#38BDF8"), ("Combined HOSR %", "#52C41A"), ("VoLTE CSSR %", "#818CF8")]:
+                fig_car.add_trace(
+                    go.Bar(name=m_col, x=df_car["Carrier"], y=df_car[m_col], marker_color=clr),
+                    secondary_y=False,
+                )
+            for d_col, clr in [("Overall DCR %", "#FF4D4F"), ("VoLTE DCR %", "#FAAD14"), ("IRAT Offload %", "#F472B6")]:
+                fig_car.add_trace(
+                    go.Scatter(name=d_col, x=df_car["Carrier"], y=df_car[d_col], mode="lines+markers", line=dict(color=clr, width=2.5), marker=dict(size=8)),
+                    secondary_y=True,
+                )
+            base_plotly_layout(fig_car, height=295)
+            fig_car.update_layout(barmode="group")
+            fig_car.update_yaxes(title_text="Success Rate (%)", range=[85, 100.5], secondary_y=False)
+            fig_car.update_yaxes(title_text="Drop / Offload Rate (%)", secondary_y=True, showgrid=False)
+            st.plotly_chart(fig_car, use_container_width=True)
+        else:
+            st.info("Carrier `earfcndl` column not present.")
 
-            mini_grid_cls = "mini-kpi-grid cols-5" if result.has_volte_counters else "mini-kpi-grid cols-4"
-            intra_str = f"{cell_row['Intra_HOSR']:.2f}%" if cell_row["Intra_HO_Denom"] > 0 else "N/A"
-            inter_str = f"{cell_row['Inter_HOSR']:.2f}%" if cell_row["Inter_HO_Denom"] > 0 else "N/A"
-            comb_str = f"{cell_row['HOSR']:.2f}%" if cell_row["HO_Denom"] > 0 else "N/A"
-            intra_col = (
-                "#FF4D4F"
-                if cell_row["Intra_HO_Denom"] >= 20 and cell_row["Intra_HOSR"] < 92.0
-                else ("#FAAD14" if cell_row["Intra_HO_Denom"] >= 20 and cell_row["Intra_HOSR"] < 96.0 else "#F8FAFC")
-            )
-            inter_col = (
-                "#FF4D4F"
-                if cell_row["Inter_HO_Denom"] >= 20 and cell_row["Inter_HOSR"] < 88.0
-                else ("#FAAD14" if cell_row["Inter_HO_Denom"] >= 20 and cell_row["Inter_HOSR"] < 94.0 else "#F8FAFC")
-            )
-            comb_col = (
-                "#FF4D4F"
-                if cell_row["HO_Denom"] >= 20 and cell_row["HOSR"] < 90.0
-                else ("#FAAD14" if cell_row["HO_Denom"] >= 20 and cell_row["HOSR"] < 95.0 else "#F8FAFC")
-            )
-            volte_mini_html = ""
-            if result.has_volte_counters:
-                vc_val = float(cell_row["VoLTE_CSSR"])
-                vd_val = float(cell_row["VoLTE_DCR"])
-                vc_col = "#FF4D4F" if vc_val < 95.0 else ("#FAAD14" if vc_val < 97.5 else "#52C41A")
-                vd_col = "#FF4D4F" if vd_val > 2.0 else ("#FAAD14" if vd_val > 0.8 else "#52C41A")
-                volte_mini_html = f"""
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">VoLTE CSSR</div>
-                      <div class="mk-val" style="color:{vc_col};">{vc_val:.2f}%</div>
-                    </div>
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">VoLTE DCR</div>
-                      <div class="mk-val" style="color:{vd_col};">{vd_val:.2f}%</div>
-                    </div>
-                """
 
-            render_html(
-                f"""
-                <div class="inspector-drawer drawer-{html.escape(st_val)}">
-                  <div class="drawer-top">
+# ==============================================================================
+# 8. TIER 3 — MASTER DATA GRID & DEEP-DIVE INSPECTOR / AMOS TERMINAL (7 : 5)
+# ==============================================================================
+
+st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
+col_grid, col_inspector = st.columns([7, 5], gap="medium")
+
+# Sort table so CRITICAL -> DEGRADED -> NORMAL -> STAT_INSIGNIFICANT appear first,
+# and pin Pareto-selected cell to Row 0 if cross-filtered!
+sev_rank_map = {"CRITICAL": 0, "DEGRADED": 1, "NORMAL": 2, "STAT_INSIGNIFICANT": 3}
+grid_source = active_filtered_df.copy()
+if grid_source.empty:
+    grid_source = active_scope_df.copy()
+
+grid_source["_sev_order"] = grid_source["Severity"].map(sev_rank_map).fillna(9)
+grid_source["_pin"] = np.where(
+    grid_source["EUtranCell Id"] == st.session_state["selected_cell_id"]
+    if st.session_state["selected_cell_id"]
+    else False,
+    0,
+    1,
+)
+grid_source = (
+    grid_source.sort_values(["_pin", "_sev_order", "DCR_Overall_Pct"], ascending=[True, True, False])
+    .drop(columns=["_pin", "_sev_order"])
+    .reset_index(drop=True)
+)
+
+with col_grid:
+    st.markdown(
+        f"<div class='panel-hdr'>"
+        f"<span>🗂️ Master Diagnostic Matrix ({len(active_filtered_df):,} Matching Records — Select Row to Inspect)</span>"
+        f"<span class='mono-num' style='font-size:0.74rem;color:#94A3B8;'>Preset: {selected_preset}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    display_cols = [
+        "Severity",
+        "ERBS Id",
+        "EUtranCell Id",
+        "earfcndl",
+        "ROP_Time",
+        "Primary_Metric",
+        "Isolated_Phase",
+        "Root_Cause",
+        "Confidence",
+        "CSSR_Pct",
+        "DCR_Overall_Pct",
+        "Combined_HOSR_Pct",
+        "VoLTE_DCR_Rel_Pct",
+        "Avg_CQI",
+        "UL_Interf_Avg_dBm",
+        "PRB_Peak_to_Median_dB",
+        "IRAT_Offload_Pct",
+    ]
+    display_cols = [c for c in display_cols if c in grid_source.columns]
+
+    def _style_severity(val: Any) -> str:
+        s = str(val)
+        if s == "CRITICAL":
+            return "background-color: rgba(255, 77, 79, 0.22); color: #FF4D4F; font-weight: 700;"
+        if s == "DEGRADED":
+            return "background-color: rgba(250, 173, 20, 0.20); color: #FAAD14; font-weight: 700;"
+        if s == "NORMAL":
+            return "background-color: rgba(82, 196, 26, 0.16); color: #52C41A; font-weight: 600;"
+        return "background-color: rgba(100, 116, 139, 0.18); color: #94A3B8;"
+
+    styled_df = grid_source[display_cols].style.map(_style_severity, subset=["Severity"])
+
+    grid_event = st.dataframe(
+        styled_df,
+        use_container_width=True,
+        height=540,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "Confidence": st.column_config.NumberColumn("Conf %", format="%d%%"),
+            "CSSR_Pct": st.column_config.NumberColumn("CSSR %", format="%.2f%%"),
+            "DCR_Overall_Pct": st.column_config.NumberColumn("DCR %", format="%.2f%%"),
+            "Combined_HOSR_Pct": st.column_config.NumberColumn("HOSR %", format="%.2f%%"),
+            "VoLTE_DCR_Rel_Pct": st.column_config.NumberColumn("VoLTE DCR", format="%.2f%%"),
+            "Avg_CQI": st.column_config.NumberColumn("Avg CQI", format="%.2f"),
+            "UL_Interf_Avg_dBm": st.column_config.NumberColumn("UL dBm", format="%.1f"),
+            "PRB_Peak_to_Median_dB": st.column_config.NumberColumn("PIM ΔdB", format="%.1f"),
+            "IRAT_Offload_Pct": st.column_config.NumberColumn("IRAT %", format="%.2f%%"),
+        },
+        key="master_grid_table",
+    )
+
+    if grid_event and grid_event.selection and grid_event.selection.rows:
+        sel_idx = grid_event.selection.rows[0]
+        if 0 <= sel_idx < len(grid_source):
+            picked = grid_source.iloc[sel_idx]
+            st.session_state["selected_cell_id"] = str(picked["EUtranCell Id"])
+            st.session_state["selected_rop_time"] = str(picked.get("ROP_Time", ""))
+
+# Resolve active inspected row (default to top worst row if nothing clicked yet)
+inspected_row: Optional[pd.Series] = None
+if st.session_state["selected_cell_id"]:
+    cand = grid_source[grid_source["EUtranCell Id"] == st.session_state["selected_cell_id"]]
+    if not is_cell_view and st.session_state["selected_rop_time"] and "ROP_Time" in cand.columns:
+        rop_cand = cand[cand["ROP_Time"] == st.session_state["selected_rop_time"]]
+        if not rop_cand.empty:
+            cand = rop_cand
+    if cand.empty:
+        cand = active_scope_df[active_scope_df["EUtranCell Id"] == st.session_state["selected_cell_id"]]
+    if not cand.empty:
+        inspected_row = cand.iloc[0]
+
+if inspected_row is None and not grid_source.empty:
+    inspected_row = grid_source.iloc[0]
+
+with col_inspector:
+    st.markdown(
+        "<div class='panel-hdr'>"
+        "<span>🔬 Deep-Dive Cell Inspector &amp; AMOS Terminal</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    if inspected_row is None:
+        st.info("Select a cell from the Pareto chart or Master Data Grid to inspect.")
+    else:
+        ins_cell = str(inspected_row.get("EUtranCell Id", ""))
+        ins_erbs = str(inspected_row.get("ERBS Id", ""))
+        ins_earfcn = str(inspected_row.get("earfcndl", ""))
+        ins_rop = str(inspected_row.get("ROP_Time", ""))
+        ins_sev = str(inspected_row.get("Severity", "NORMAL"))
+        ins_scen = str(inspected_row.get("Scenario", "NONE"))
+        ins_conf = int(inspected_row.get("Confidence", 0) or 0)
+
+        st.markdown(
+            f"""
+            <div class="inspector-box">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
                     <div>
-                      <div class="drawer-cell-id">{html.escape(str(cell_row['EUtranCellFDD']))}</div>
-                      <div class="drawer-enb-id">eNodeB: {html.escape(str(cell_row['eNodeB_Name']))} &bull; {html.escape(str(cell_row['RCA_Category']))} &bull; Phase: {html.escape(str(cell_row['Isolated_Phase']))}</div>
+                        <span class="mono-num" style="font-size:1.02rem;font-weight:700;color:#38BDF8;">{ins_cell}</span>
+                        <span class="mono-num" style="font-size:0.76rem;color:#94A3B8;margin-left:8px;">({ins_erbs} • EARFCN {ins_earfcn})</span>
                     </div>
-                    <div style="text-align:right;">
-                      {status_badge_html(st_val)}
-                      <div class="mono-num" style="font-size:0.72rem;color:#94A3B8;margin-top:5px;">
-                        Confidence: <strong style="color:#F8FAFC;">{conf_val}%</strong>
-                      </div>
-                    </div>
-                  </div>
-                  <div class="{mini_grid_cls}">
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">CSSR</div>
-                      <div class="mk-val" style="color:{'#FF4D4F' if cell_row['CSSR']<97 else '#52C41A'};">{cell_row['CSSR']:.2f}%</div>
-                    </div>
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">Overall DCR</div>
-                      <div class="mk-val" style="color:{'#FF4D4F' if cell_row['DCR_Overall']>2.5 else ('#FAAD14' if cell_row['DCR_Overall']>1.0 else '#52C41A')};">{cell_row['DCR_Overall']:.2f}%</div>
-                    </div>
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">eNB DCR</div>
-                      <div class="mk-val" style="color:{'#FF4D4F' if cell_row['DCR_eNB']>2.5 else ('#FAAD14' if cell_row['DCR_eNB']>1.0 else '#52C41A')};">{cell_row['DCR_eNB']:.2f}%</div>
-                    </div>
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">Intra HOSR</div>
-                      <div class="mk-val" style="color:{intra_col};">{intra_str}</div>
-                    </div>
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">Inter HOSR</div>
-                      <div class="mk-val" style="color:{inter_col};">{inter_str}</div>
-                    </div>
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">Comb HOSR</div>
-                      <div class="mk-val" style="color:{comb_col};">{comb_str}</div>
-                    </div>
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">Avg CQI</div>
-                      <div class="mk-val">{cqi_str}</div>
-                    </div>
-                    <div class="mini-kpi">
-                      <div class="mk-lbl">UL Noise</div>
-                      <div class="mk-val" style="color:{'#FF4D4F' if pd.notna(cell_row['UL_Intf_dBm']) and cell_row['UL_Intf_dBm']>-110 else '#38BDF8'};">{intf_str} dBm</div>
-                    </div>
-                    {volte_mini_html}
-                  </div>
-                  <div class="rca-callout">
-                    <div style="color:#F8FAFC;font-weight:600;">🎯 {html.escape(str(cell_row['Primary_Root_Cause']))}</div>
-                    <div style="color:#94A3B8;margin-top:4px;">💡 <strong>Remediation:</strong> {html.escape(str(cell_row['Recommendation']))}</div>
-                    {secondary_html}
-                  </div>
-                  <div style="font-size:0.70rem;font-weight:700;letter-spacing:0.06em;color:#94A3B8;margin-bottom:5px;">
-                    DIAGNOSTIC PM COUNTER EVIDENCE
-                  </div>
-                  <table class="ev-grid">
-                    <thead>
-                      <tr><th>PM Counter / Vector</th><th>Measured</th><th>Operational Diagnostic</th></tr>
-                    </thead>
-                    <tbody>{ev_rows_html}</tbody>
-                  </table>
-                  <div class="amos-terminal-wrap">
-                    <div class="amos-term-bar">
-                      <div class="amos-dots">
-                        <span style="background:#FF5F56;"></span>
-                        <span style="background:#FFBD2E;"></span>
-                        <span style="background:#27C93F;"></span>
-                        <strong style="color:#E2E8F0;margin-left:4px;">moshell@{html.escape(str(cell_row['eNodeB_Name']))}</strong>
-                      </div>
-                      <span>AMOS / MOM CLI</span>
-                    </div>
-                    <div class="amos-code-box">{amos_lines_html}</div>
-                  </div>
+                    <span class="sev-badge sev-{ins_sev}">{ins_sev}</span>
                 </div>
-                """
+                <div style="font-size:0.8rem;color:#E2E8F0;margin-bottom:4px;">
+                    <b>Isolated Phase:</b> <span class="mono-num" style="color:#FAAD14;">{inspected_row.get('Primary_Metric', '')} — {inspected_row.get('Isolated_Phase', '')}</span>
+                    &nbsp;|&nbsp; <b>Scenario:</b> <span class="mono-num">{ins_scen}</span> ({ins_conf}%)
+                </div>
+                <div style="font-size:0.82rem;color:#F8FAFC;background:#0B0F19;border-left:3px solid #38BDF8;padding:6px 10px;border-radius:4px;">
+                    <b>Root Cause:</b> {inspected_row.get('Root_Cause', '')}
+                </div>
+                <div class="evidence-grid">
+                    <div class="ev-cell"><div class="ev-lbl">RACH OOC Disc</div><div class="ev-val">{int(inspected_row.get('pmRaFailCbraMsg1DiscOoc', 0) or 0):,}</div></div>
+                    <div class="ev-cell"><div class="ev-lbl">Drops (UE Lost)</div><div class="ev-val">{int(inspected_row.get('pmErabRelAbnormalEnbActUeLost', 0) or 0):,}</div></div>
+                    <div class="ev-cell"><div class="ev-lbl">Drops (HO / MME)</div><div class="ev-val">{int(inspected_row.get('pmErabRelAbnormalEnbActHo', 0) or 0)} / {int(inspected_row.get('pmErabRelAbnormalMmeAct', 0) or 0)}</div></div>
+                    <div class="ev-cell"><div class="ev-lbl">RLC UL Poll Retx</div><div class="ev-val">{int(inspected_row.get('pmRlcPollRetxUl', 0) or 0):,}</div></div>
+                    <div class="ev-cell"><div class="ev-lbl">UL Noise Floor</div><div class="ev-val">{float(inspected_row.get('UL_Interf_Avg_dBm', -121.0)):.1f} dBm</div></div>
+                    <div class="ev-cell"><div class="ev-lbl">PIM Peak-Med Δ</div><div class="ev-val" style="color:{'#FF4D4F' if float(inspected_row.get('PRB_Peak_to_Median_dB', 0) or 0) > 6.0 else '#52C41A'};">{float(inspected_row.get('PRB_Peak_to_Median_dB', 0.0)):.2f} dB</div></div>
+                    <div class="ev-cell"><div class="ev-lbl">Avg CQI / OOR</div><div class="ev-val">{float(inspected_row.get('Avg_CQI', 0) or 0):.2f} / {float(inspected_row.get('CQI_OOR_Pct', 0) or 0):.1f}%</div></div>
+                    <div class="ev-cell"><div class="ev-lbl">MIMO Rank-1</div><div class="ev-val">{float(inspected_row.get('Rank1_Ratio_Pct', 0) or 0):.1f}%</div></div>
+                    <div class="ev-cell"><div class="ev-lbl">VoLTE PE / Drops</div><div class="ev-val">{int(inspected_row.get('pmErabRelAbnormalEnbActPeQci', 0) or 0)} / {int(inspected_row.get('VoLTE_Active_Drops', 0) or 0)}</div></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ---- 100-PRB INTERFERENCE SPECTRUM CHART ----
+        prb_table = prb_cell_scoped if is_cell_view else prb_hourly_all
+        if prb_table is not None and not prb_table.empty:
+            prb_cols = natural_prb_cols(list(prb_table.columns))
+            p_match = prb_table[prb_table["EUtranCell Id"] == ins_cell]
+            if not is_cell_view and ins_rop and "ROP_Time" in p_match.columns:
+                p_rop = p_match[p_match["ROP_Time"] == ins_rop]
+                if not p_rop.empty:
+                    p_match = p_rop
+
+            if prb_cols and not p_match.empty:
+                p_row = p_match.iloc[0]
+                n_hrs = float(p_row.get("ROP_Count", 1.0)) if is_cell_view else 1.0
+                prb_dbm = convert_prb_row_to_dbm(p_row, prb_cols, n_hours=n_hrs)
+                prb_idx = list(range(1, len(prb_cols) + 1))
+                med_dbm = float(np.median(prb_dbm))
+                peak_idx = int(np.argmax(prb_dbm)) + 1
+                peak_dbm = float(np.max(prb_dbm))
+                pim_delta_v = float(p_row.get("PRB_Peak_to_Median_dB", peak_dbm - med_dbm))
+
+                floor_y = min(float(np.min(prb_dbm)) - 1.5, -122.5)
+                fig_prb = go.Figure()
+                fig_prb.add_trace(
+                    go.Scatter(
+                        x=prb_idx,
+                        y=[floor_y] * len(prb_idx),
+                        mode="lines",
+                        line=dict(width=0),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    )
+                )
+                fig_prb.add_trace(
+                    go.Scatter(
+                        x=prb_idx,
+                        y=prb_dbm,
+                        mode="lines",
+                        fill="tonexty",
+                        name="PRB UL Noise (dBm)",
+                        line=dict(color="#FF4D4F" if pim_delta_v > 6.0 else "#38BDF8", width=2.0),
+                        fillcolor="rgba(255, 77, 79, 0.18)" if pim_delta_v > 6.0 else "rgba(56, 189, 248, 0.15)",
+                        hovertemplate="<b>PRB %{x}</b>: %{y:.2f} dBm<extra></extra>",
+                    )
+                )
+                fig_prb.add_hline(
+                    y=med_dbm,
+                    line_dash="dash",
+                    line_color="#94A3B8",
+                    annotation_text=f"Median ({med_dbm:.1f} dBm)",
+                    annotation_position="bottom right",
+                )
+                fig_prb.add_hline(
+                    y=med_dbm + 6.0,
+                    line_dash="dot",
+                    line_color="#FAAD14",
+                    annotation_text="+6 dB PIM Gate",
+                    annotation_position="top right",
+                )
+                fig_prb.add_annotation(
+                    x=peak_idx,
+                    y=peak_dbm,
+                    text=f"Peak PRB#{peak_idx}: {peak_dbm:.1f} dBm (Δ={pim_delta_v:.1f}dB)",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowcolor="#FF4D4F",
+                    font=dict(size=10, color="#F8FAFC"),
+                    bgcolor="#0B0F19",
+                    bordercolor="#FF4D4F",
+                )
+                base_plotly_layout(fig_prb, height=225, title=f"100-PRB UL Interference Spectrum — {ins_cell}")
+                fig_prb.update_xaxes(title_text="Physical Resource Block (PRB 1 .. PRB 100)", range=[1, len(prb_cols)])
+                fig_prb.update_yaxes(
+                    title_text="dBm / PRB",
+                    range=[min(float(np.min(prb_dbm)) - 1.5, -122.0), max(peak_dbm + 3.0, -108.0)],
+                )
+                st.plotly_chart(fig_prb, use_container_width=True)
+
+        # ---- AMOS / MOSHELL REMEDIATION TERMINAL ----
+        amos_script_str = generate_amos_script(inspected_row)
+        t_hdr_l, t_hdr_r = st.columns([6.5, 3.5], vertical_alignment="center")
+        with t_hdr_l:
+            st.markdown(
+                "<div style='font-family:Space Grotesk,sans-serif;font-size:0.88rem;font-weight:700;color:#38BDF8;'>"
+                "💻 AMOS / Moshell Remediation Terminal (One-Click Copy Top-Right)</div>",
+                unsafe_allow_html=True,
+            )
+        with t_hdr_r:
+            st.download_button(
+                label="💾 Save .mos",
+                data=amos_script_str.encode("utf-8"),
+                file_name=f"remediate_{ins_cell}.mos",
+                mime="text/plain",
+                use_container_width=True,
             )
 
-            render_copy_button(
-                amos_text,
-                f"One-Click Copy AMOS Command ({cell_row['EUtranCellFDD']})",
-                key_id=f"copy_single_{active_cell_name.replace('-', '_')}",
-            )
-
-
-if __name__ == "__main__":
-    main()
+        st.code(amos_script_str, language="bash")

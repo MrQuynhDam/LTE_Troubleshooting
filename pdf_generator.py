@@ -1,924 +1,593 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Executive HTML-to-PDF Report Exporter for Ericsson LTE RAN Troubleshooting Cockpit.
-
-Coordinates `html-to-pdf` print-CSS standards (Headless Chromium `--headless=new`
-with exact color reproduction, WeasyPrint/Playwright support, and pure-Python
-ReportLab fallback) so color-coded CRITICAL/DEGRADED/NORMAL telemetry badges and
-AMOS/Moshell terminal remediation blocks always export cleanly to PDF.
+Antigravity Ericsson LTE & VoLTE Diagnostic PDF Report Engine
+Pure ReportLab Platypus implementation (zero headless browser or GTK/C dependencies).
+Preserves NOC semantic severity badges, KPI summary matrix, counter evidence,
+and copy-ready AMOS/Moshell remediation scripts.
 """
 
 from __future__ import annotations
 
-import html
 import io
 import os
-import shutil
-import subprocess
-import uuid
-from pathlib import Path
-from typing import List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    HRFlowable,
+    KeepTogether,
+    PageBreak,
+    Paragraph,
+    Preformatted,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
-from rca_engine import AnalysisResult
+# NOC Telemetry Semantic Palette
+CLR_BG_DARK = colors.HexColor("#0B0F19")
+CLR_CARD_DARK = colors.HexColor("#151D2E")
+CLR_BORDER = colors.HexColor("#CBD5E1")
+CLR_BORDER_DARK = colors.HexColor("#1E293B")
+CLR_ACCENT = colors.HexColor("#0284C7")
+CLR_CRITICAL = colors.HexColor("#FF4D4F")
+CLR_CRITICAL_BG = colors.HexColor("#FFF1F0")
+CLR_DEGRADED = colors.HexColor("#D48806")
+CLR_DEGRADED_BG = colors.HexColor("#FFFBE6")
+CLR_NORMAL = colors.HexColor("#389E0D")
+CLR_NORMAL_BG = colors.HexColor("#F6FFED")
+CLR_INSIG = colors.HexColor("#64748B")
+CLR_INSIG_BG = colors.HexColor("#F1F5F9")
+CLR_TEXT_MAIN = colors.HexColor("#0F172A")
+CLR_TEXT_MUTED = colors.HexColor("#475569")
+CLR_TERM_TEXT = colors.HexColor("#E2E8F0")
 
 
-def _find_chromium_binary() -> Optional[str]:
-    """Locate Chrome, Chromium, or Edge binary across Windows/Linux/macOS."""
+def _register_fonts() -> Dict[str, str]:
+    """
+    Registers Unicode-capable system fonts (Segoe UI / Arial + Consolas) on Windows/Linux
+    when available, gracefully falling back to built-in Helvetica / Courier.
+    """
+    font_map = {
+        "sans": "Helvetica",
+        "sans_bold": "Helvetica-Bold",
+        "mono": "Courier",
+        "mono_bold": "Courier-Bold",
+    }
     candidates = [
-        shutil.which("google-chrome"),
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-        shutil.which("chrome"),
-        shutil.which("msedge"),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ("sans", "AntigravitySans", ["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]),
+        ("sans_bold", "AntigravitySansBold", ["C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]),
+        ("mono", "AntigravityMono", ["C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/cour.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"]),
+        ("mono_bold", "AntigravityMonoBold", ["C:/Windows/Fonts/consolab.ttf", "C:/Windows/Fonts/courbd.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"]),
     ]
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
+    for key, alias, paths in candidates:
+        for p in paths:
+            if os.path.exists(p):
+                try:
+                    pdfmetrics.registerFont(TTFont(alias, p))
+                    font_map[key] = alias
+                    break
+                except Exception:
+                    continue
+    return font_map
 
 
-def _status_badge_html(status: str) -> str:
-    st_upper = str(status).upper()
-    if st_upper == "CRITICAL":
-        return '<span class="badge badge-critical">CRITICAL</span>'
-    if st_upper == "DEGRADED":
-        return '<span class="badge badge-degraded">DEGRADED</span>'
-    if st_upper == "NORMAL":
-        return '<span class="badge badge-normal">NORMAL</span>'
-    return '<span class="badge badge-low">LOW SAMPLE</span>'
+def _severity_colors(severity: str) -> tuple[colors.Color, colors.Color]:
+    sev = str(severity).upper()
+    if sev == "CRITICAL":
+        return CLR_CRITICAL, CLR_CRITICAL_BG
+    if sev == "DEGRADED":
+        return CLR_DEGRADED, CLR_DEGRADED_BG
+    if sev == "NORMAL":
+        return CLR_NORMAL, CLR_NORMAL_BG
+    return CLR_INSIG, CLR_INSIG_BG
 
 
-def build_html_report(
-    result: AnalysisResult,
-    filtered_df: pd.DataFrame,
-    max_deep_dive: int = 12,
-) -> str:
-    """
-    Construct a self-contained, print-engineered HTML5 report preserving NOC
-    semantic status badges, tabular monospace KPI columns, and AMOS CLI blocks.
-    """
-    full_df = result.cell_df
-    total_cells = len(full_df)
-    low_sample_cnt = int((full_df["Status"] == "LOW_SAMPLE").sum())
-    worst_df = full_df[full_df["Status"].isin(["CRITICAL", "DEGRADED"])]
-    worst_cnt = len(worst_df)
-    crit_cnt = int((full_df["Status"] == "CRITICAL").sum())
-    deg_cnt = int((full_df["Status"] == "DEGRADED").sum())
-    worst_pct = (worst_cnt / total_cells * 100.0) if total_cells > 0 else 0.0
-
-    valid_cssr_df = full_df[full_df["CSSR_Denom"] >= 30]
-    avg_cssr = float(valid_cssr_df["CSSR"].mean()) if not valid_cssr_df.empty else float(full_df["CSSR"].mean())
-    cssr_delta = avg_cssr - 98.5
-
-    valid_dcr_df = full_df[full_df["DCR_Denom"] >= 30]
-    avg_dcr_ovr = (
-        float(valid_dcr_df["DCR_Overall"].mean())
-        if not valid_dcr_df.empty
-        else float(full_df["DCR_Overall"].mean())
-    )
-    avg_dcr_enb = (
-        float(valid_dcr_df["DCR_eNB"].mean())
-        if not valid_dcr_df.empty
-        else float(full_df["DCR_eNB"].mean())
-    )
-    valid_ho_df = full_df[full_df["HO_Denom"] >= 20] if "HO_Denom" in full_df.columns else pd.DataFrame()
-    avg_hosr = (
-        float(valid_ho_df["HOSR"].mean())
-        if not valid_ho_df.empty
-        else (float(full_df["HOSR"].mean()) if not full_df.empty else 100.0)
-    )
-    avg_cqi = float(full_df["Avg_CQI"].dropna().mean()) if full_df["Avg_CQI"].notna().any() else 0.0
-
-    has_volte = bool(getattr(result, "has_volte_counters", False))
-    valid_vc_df = full_df[full_df["VoLTE_CSSR_Denom"] >= 10] if "VoLTE_CSSR_Denom" in full_df.columns else pd.DataFrame()
-    avg_vcssr = (
-        float(valid_vc_df["VoLTE_CSSR"].mean())
-        if not valid_vc_df.empty
-        else (float(full_df["VoLTE_CSSR"].mean()) if "VoLTE_CSSR" in full_df.columns else 100.0)
-    )
-    valid_vd_df = full_df[full_df["VoLTE_DCR_Denom"] >= 10] if "VoLTE_DCR_Denom" in full_df.columns else pd.DataFrame()
-    avg_vdcr = (
-        float(valid_vd_df["VoLTE_DCR"].mean())
-        if not valid_vd_df.empty
-        else (float(full_df["VoLTE_DCR"].mean()) if "VoLTE_DCR" in full_df.columns else 0.0)
-    )
-
-    # Target table rows (prioritize filtered view if non-empty, else worst cells)
-    report_df = filtered_df.copy() if not filtered_df.empty else worst_df.copy()
-    if report_df.empty:
-        report_df = full_df.head(25).copy()
-
-    # Root cause distribution summary
-    rca_counts = (
-        worst_df["RCA_Category"].value_counts()
-        if not worst_df.empty
-        else report_df["RCA_Category"].value_counts()
-    )
-    rca_pills_html = "".join(
-        f'<div class="rca-pill"><span class="rca-name">{html.escape(str(cat))}</span>'
-        f'<span class="rca-val">{int(cnt)} cells</span></div>'
-        for cat, cnt in rca_counts.items()
-    )
-
-    # Matrix table rows (up to 45 worst/filtered cells for clean executive pagination)
-    matrix_rows: List[str] = []
-    for _, r in report_df.head(45).iterrows():
-        cqi_txt = f"{r['Avg_CQI']:.2f}" if pd.notna(r.get("Avg_CQI")) else "N/A"
-        intf_txt = f"{r['UL_Intf_dBm']:.1f}" if pd.notna(r.get("UL_Intf_dBm")) else "N/A"
-        conf_txt = f"{int(r['Confidence_Score'])}%" if int(r.get("Confidence_Score", 0)) > 0 else "N/A"
-        dcr_o = float(r.get("DCR_Overall", r.get("DCR", 0.0)))
-        dcr_e = float(r.get("DCR_eNB", 0.0))
-        dcr_cls_cell = (
-            "txt-crit"
-            if dcr_o > 2.5 and r["DCR_Denom"] >= 30
-            else ("txt-deg" if dcr_o > 1.0 and r["DCR_Denom"] >= 30 else "")
-        )
-        volte_td_html = ""
-        if has_volte:
-            vc_r = float(r.get("VoLTE_CSSR", 100.0))
-            vd_r = float(r.get("VoLTE_DCR", 0.0))
-            vd_cls = (
-                "txt-crit"
-                if vd_r > 2.0 and r.get("VoLTE_DCR_Denom", 0) >= 10
-                else ("txt-deg" if vd_r > 0.8 and r.get("VoLTE_DCR_Denom", 0) >= 10 else "")
-            )
-            volte_td_html = (
-                f'<td class="mono num">{vc_r:.2f}%</td>'
-                f'<td class="mono num {vd_cls}">{vd_r:.2f}%</td>'
-            )
-        intra_txt = f"{r['Intra_HOSR']:.2f}%" if float(r.get("Intra_HO_Denom", 0)) > 0 else "—"
-        inter_txt = f"{r['Inter_HOSR']:.2f}%" if float(r.get("Inter_HO_Denom", 0)) > 0 else "—"
-        comb_txt = f"{r['HOSR']:.2f}%" if float(r.get("HO_Denom", 0)) > 0 else "—"
-        intra_cls = (
-            "txt-crit"
-            if float(r.get("Intra_HO_Denom", 0)) >= 20 and float(r.get("Intra_HOSR", 100.0)) < 92.0
-            else ("txt-deg" if float(r.get("Intra_HO_Denom", 0)) >= 20 and float(r.get("Intra_HOSR", 100.0)) < 96.0 else "")
-        )
-        inter_cls = (
-            "txt-crit"
-            if float(r.get("Inter_HO_Denom", 0)) >= 20 and float(r.get("Inter_HOSR", 100.0)) < 88.0
-            else ("txt-deg" if float(r.get("Inter_HO_Denom", 0)) >= 20 and float(r.get("Inter_HOSR", 100.0)) < 94.0 else "")
-        )
-        matrix_rows.append(
-            f"""
-            <tr>
-              <td>{_status_badge_html(r['Status'])}</td>
-              <td class="mono">{html.escape(str(r['eNodeB_Name']))}</td>
-              <td class="mono fw-600">{html.escape(str(r['EUtranCellFDD']))}</td>
-              <td class="mono num">{r['CSSR']:.2f}%</td>
-              <td class="mono num {dcr_cls_cell}">{dcr_o:.2f}%</td>
-              <td class="mono num">{dcr_e:.2f}%</td>
-              <td class="mono num {intra_cls}">{intra_txt}</td>
-              <td class="mono num {inter_cls}">{inter_txt}</td>
-              <td class="mono num">{comb_txt}</td>
-              {volte_td_html}
-              <td class="mono num">{cqi_txt}</td>
-              <td class="mono num">{intf_txt}</td>
-              <td>{html.escape(str(r['RCA_Category']))}</td>
-              <td class="mono">{html.escape(str(r.get('Isolated_Phase', 'N/A')))}</td>
-              <td>{html.escape(str(r['Primary_Root_Cause']))}</td>
-              <td class="mono num">{conf_txt}</td>
-            </tr>
-            """
-        )
-
-    # Deep-dive diagnostic & AMOS blocks for Top Degraded Cells in current selection
-    deep_candidates = report_df[report_df["Status"].isin(["CRITICAL", "DEGRADED"])].head(max_deep_dive)
-    if deep_candidates.empty:
-        deep_candidates = report_df.head(min(5, len(report_df)))
-
-    deep_cards: List[str] = []
-    for idx, (_, r) in enumerate(deep_candidates.iterrows(), start=1):
-        ev_list = r.get("Diagnostic_Evidence", [])
-        ev_rows = "".join(
-            f"<tr><td class='mono'>{html.escape(str(item['Counter / Indicator']))}</td>"
-            f"<td class='mono fw-600'>{html.escape(str(item['Value']))}</td>"
-            f"<td>{html.escape(str(item['Meaning']))}</td></tr>"
-            for item in ev_list[:14]
-        )
-        amos_escaped = html.escape(str(r.get("AMOS_Script", "")))
-        deep_cards.append(
-            f"""
-            <div class="deep-card">
-              <div class="deep-header">
-                <div>
-                  <span class="deep-idx">#{idx:02d}</span>
-                  <span class="mono deep-cell">{html.escape(str(r['EUtranCellFDD']))}</span>
-                  <span class="mono deep-enb">({html.escape(str(r['eNodeB_Name']))})</span>
-                </div>
-                <div>
-                  {_status_badge_html(r['Status'])}
-                  <span class="conf-chip mono">Confidence: {int(r['Confidence_Score'])}%</span>
-                </div>
-              </div>
-              <div class="deep-meta">
-                <strong>Isolated Phase:</strong> <span class="mono">{html.escape(str(r.get('Isolated_Phase', 'N/A')))}</span> &bull;
-                <strong>Primary Root Cause:</strong> {html.escape(str(r['Primary_Root_Cause']))}<br/>
-                <strong>Action Recommendation:</strong> {html.escape(str(r['Recommendation']))}
-              </div>
-              <div class="deep-grid">
-                <div>
-                  <div class="sub-label">DIAGNOSTIC EVIDENCE &amp; PM COUNTERS</div>
-                  <table class="ev-table">
-                    <thead><tr><th>PM Counter / Metric</th><th>Measured</th><th>Engineering Note</th></tr></thead>
-                    <tbody>{ev_rows}</tbody>
-                  </table>
-                </div>
-                <div>
-                  <div class="sub-label">AUTOMATED AMOS / MOSHELL CLI PROTOCOL</div>
-                  <pre class="amos-box">{amos_escaped}</pre>
-                </div>
-              </div>
-            </div>
-            """
-        )
-
-    doc_id = f"RAN-RCA-{pd.Timestamp.now().strftime('%Y%m%d-%H%M')}"
-    cssr_cls = "txt-ok" if cssr_delta >= 0 else "txt-deg"
-    dcr_cls = "txt-crit" if avg_dcr_ovr > 2.5 else ("txt-deg" if avg_dcr_ovr > 1.0 else "txt-ok")
-    volte_kpi_sub_cssr = f" &bull; VoLTE SR: {avg_vcssr:.2f}%" if has_volte else ""
-    volte_kpi_sub_dcr = f" &bull; VoLTE DCR: {avg_vdcr:.2f}%" if has_volte else ""
-    volte_th_html = (
-        '<th class="num" style="width:52px;">VoLTE SR</th>'
-        '<th class="num" style="width:54px;">VoLTE DCR</th>'
-        if has_volte
-        else ""
-    )
-
-    return f"""<!DOCTYPE html>
-<html lang="vi">
-<head>
-  <meta charset="UTF-8" />
-  <title>Ericsson LTE RAN RCA Executive Report - {html.escape(result.source_name)}</title>
-  <style>
-    @page {{
-      size: A4 landscape;
-      margin: 11mm 12mm 11mm 12mm;
-    }}
-    html, body {{
-      margin: 0;
-      padding: 0;
-      -webkit-print-color-adjust: exact !important;
-      print-color-adjust: exact !important;
-      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
-      color: #0F172A;
-      background: #FFFFFF;
-      font-size: 9pt;
-      line-height: 1.42;
-    }}
-    .mono {{
-      font-family: 'JetBrains Mono', 'Roboto Mono', Consolas, 'Courier New', monospace;
-      font-variant-numeric: tabular-nums;
-    }}
-    .fw-600 {{ font-weight: 600; }}
-    .num {{ text-align: right; }}
-    .txt-crit {{ color: #DC2626; font-weight: 700; }}
-    .txt-deg {{ color: #D97706; font-weight: 700; }}
-    .txt-ok {{ color: #16A34A; font-weight: 700; }}
-
-    /* Branded NOC Dark Header */
-    .report-header {{
-      background: linear-gradient(135deg, #0B0F19 0%, #151D2E 65%, #1E293B 100%);
-      color: #F8FAFC;
-      padding: 16px 22px;
-      border-radius: 8px;
-      border-bottom: 3px solid #38BDF8;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 14px;
-    }}
-    .brand-left {{
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }}
-    .brand-title h1 {{
-      margin: 0;
-      font-size: 15.5pt;
-      letter-spacing: -0.02em;
-      color: #FFFFFF;
-    }}
-    .brand-title p {{
-      margin: 3px 0 0 0;
-      font-size: 8.5pt;
-      color: #94A3B8;
-    }}
-    .brand-meta {{
-      text-align: right;
-      font-size: 8pt;
-      color: #CBD5E1;
-      line-height: 1.55;
-    }}
-
-    /* Executive KPI Strip */
-    .kpi-strip {{
-      display: table;
-      width: 100%;
-      table-layout: fixed;
-      border-spacing: 8px 0;
-      margin: 0 -8px 14px -8px;
-    }}
-    .kpi-card {{
-      display: table-cell;
-      background: #0F172A;
-      color: #F8FAFC;
-      border: 1px solid #1E293B;
-      border-top: 3px solid #38BDF8;
-      border-radius: 6px;
-      padding: 10px 14px;
-      vertical-align: top;
-    }}
-    .kpi-card.crit-border {{ border-top-color: #FF4D4F; }}
-    .kpi-card.deg-border {{ border-top-color: #FAAD14; }}
-    .kpi-card.ok-border {{ border-top-color: #52C41A; }}
-    .kpi-label {{
-      font-size: 7.5pt;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: #94A3B8;
-      margin-bottom: 4px;
-    }}
-    .kpi-val {{
-      font-size: 16pt;
-      font-weight: 700;
-      color: #FFFFFF;
-    }}
-    .kpi-sub {{
-      font-size: 7.8pt;
-      color: #CBD5E1;
-      margin-top: 3px;
-    }}
-
-    /* Status Badges matching Dark OLED Cockpit */
-    .badge {{
-      display: inline-block;
-      padding: 2px 7px;
-      border-radius: 4px;
-      font-size: 7.2pt;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      font-family: Consolas, monospace;
-    }}
-    .badge-critical {{
-      color: #FF4D4F;
-      background: rgba(255, 77, 79, 0.14);
-      border: 1px solid rgba(255, 77, 79, 0.55);
-    }}
-    .badge-degraded {{
-      color: #D97706;
-      background: rgba(250, 173, 20, 0.16);
-      border: 1px solid rgba(250, 173, 20, 0.60);
-    }}
-    .badge-normal {{
-      color: #15803D;
-      background: rgba(82, 196, 26, 0.15);
-      border: 1px solid rgba(82, 196, 26, 0.55);
-    }}
-    .badge-low {{
-      color: #475569;
-      background: #F1F5F9;
-      border: 1px solid #CBD5E1;
-    }}
-
-    .section-title {{
-      font-size: 11pt;
-      font-weight: 700;
-      color: #0B0F19;
-      border-left: 4px solid #0284C7;
-      padding-left: 8px;
-      margin: 14px 0 8px 0;
-    }}
-
-    .rca-bar {{
-      margin-bottom: 12px;
-    }}
-    .rca-pill {{
-      display: inline-block;
-      background: #F8FAFC;
-      border: 1px solid #CBD5E1;
-      border-radius: 4px;
-      padding: 3px 9px;
-      margin: 0 6px 6px 0;
-      font-size: 8pt;
-    }}
-    .rca-name {{ font-weight: 600; color: #1E293B; margin-right: 6px; }}
-    .rca-val {{ font-family: Consolas, monospace; color: #0284C7; font-weight: 700; }}
-
-    /* Master Table */
-    table.master-table {{
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 7.8pt;
-      margin-bottom: 16px;
-    }}
-    table.master-table th {{
-      background: #0B0F19;
-      color: #E2E8F0;
-      text-align: left;
-      padding: 6px 6px;
-      font-weight: 600;
-      border: 1px solid #1E293B;
-    }}
-    table.master-table td {{
-      padding: 5px 6px;
-      border: 1px solid #E2E8F0;
-      vertical-align: middle;
-    }}
-    table.master-table tr:nth-child(even) td {{
-      background: #F8FAFC;
-    }}
-    tr {{
-      break-inside: avoid;
-      page-break-inside: avoid;
-    }}
-
-    .page-break {{
-      break-before: page;
-      page-break-before: always;
-    }}
-
-    /* Deep Dive Cards */
-    .deep-card {{
-      border: 1px solid #CBD5E1;
-      border-left: 4px solid #0B0F19;
-      border-radius: 6px;
-      padding: 10px 12px;
-      margin-bottom: 12px;
-      background: #FFFFFF;
-      break-inside: avoid;
-      page-break-inside: avoid;
-    }}
-    .deep-header {{
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 1px solid #E2E8F0;
-      padding-bottom: 6px;
-      margin-bottom: 6px;
-    }}
-    .deep-idx {{
-      background: #0B0F19;
-      color: #38BDF8;
-      font-family: Consolas, monospace;
-      font-weight: 700;
-      padding: 2px 6px;
-      border-radius: 4px;
-      margin-right: 6px;
-      font-size: 8pt;
-    }}
-    .deep-cell {{ font-size: 10pt; font-weight: 700; color: #0F172A; }}
-    .deep-enb {{ font-size: 8.5pt; color: #64748B; margin-left: 4px; }}
-    .conf-chip {{
-      background: #0F172A;
-      color: #38BDF8;
-      padding: 2px 7px;
-      border-radius: 4px;
-      font-size: 7.5pt;
-      margin-left: 6px;
-    }}
-    .deep-meta {{
-      font-size: 8.2pt;
-      color: #1E293B;
-      background: #F8FAFC;
-      padding: 6px 8px;
-      border-radius: 4px;
-      margin-bottom: 8px;
-    }}
-    .deep-grid {{
-      display: table;
-      width: 100%;
-      table-layout: fixed;
-    }}
-    .deep-grid > div {{
-      display: table-cell;
-      vertical-align: top;
-      width: 50%;
-    }}
-    .deep-grid > div:first-child {{
-      padding-right: 8px;
-    }}
-    .deep-grid > div:last-child {{
-      padding-left: 8px;
-    }}
-    .sub-label {{
-      font-size: 7.2pt;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      color: #475569;
-      margin-bottom: 4px;
-    }}
-    table.ev-table {{
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 7.5pt;
-    }}
-    table.ev-table th {{
-      background: #E2E8F0;
-      color: #0F172A;
-      text-align: left;
-      padding: 4px 5px;
-      border: 1px solid #CBD5E1;
-    }}
-    table.ev-table td {{
-      padding: 3.5px 5px;
-      border: 1px solid #E2E8F0;
-    }}
-    pre.amos-box {{
-      margin: 0;
-      background: #05080F;
-      color: #38BDF8;
-      border: 1px solid #1E293B;
-      border-radius: 5px;
-      padding: 7px 9px;
-      font-family: 'JetBrains Mono', Consolas, monospace;
-      font-size: 6.9pt;
-      line-height: 1.35;
-      white-space: pre-wrap;
-      word-break: break-all;
-    }}
-    .footer-note {{
-      margin-top: 10px;
-      text-align: right;
-      font-size: 7.5pt;
-      color: #64748B;
-      border-top: 1px solid #E2E8F0;
-      padding-top: 6px;
-    }}
-  </style>
-</head>
-<body>
-
-  <header class="report-header">
-    <div class="brand-left">
-      <svg width="42" height="42" viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <rect width="44" height="44" rx="9" fill="#0F172A" stroke="#38BDF8" stroke-width="1.5"/>
-        <path d="M11 14L33 9.5M11 24.5L33 20M11 35L33 30.5" stroke="#38BDF8" stroke-width="4" stroke-linecap="round"/>
-        <circle cx="35" cy="9" r="3" fill="#FF4D4F"/>
-      </svg>
-      <div class="brand-title">
-        <h1>ERICSSON LTE RAN PERFORMANCE &amp; RCA DIAGNOSTIC REPORT</h1>
-        <p>Autonomous PM Counter Telemetry • Statistical Sample Gate • AMOS/Moshell Remediation</p>
-      </div>
-    </div>
-    <div class="brand-meta mono">
-      <div><strong>DOC ID:</strong> {html.escape(doc_id)}</div>
-      <div><strong>SOURCE:</strong> {html.escape(result.source_name)}</div>
-      <div><strong>ROP WINDOW:</strong> {html.escape(result.data_start_time)} &rarr; {html.escape(result.data_end_time)}</div>
-      <div><strong>GENERATED:</strong> {html.escape(result.ingestion_timestamp)}</div>
-    </div>
-  </header>
-
-  <section class="kpi-strip">
-    <div class="kpi-card">
-      <div class="kpi-label">Total Evaluated Cells</div>
-      <div class="kpi-val mono">{total_cells:,}</div>
-      <div class="kpi-sub">ROP Rows: {result.total_rop_rows:,} &bull; Low-Sample Excluded: {low_sample_cnt}</div>
-    </div>
-    <div class="kpi-card {'crit-border' if crit_cnt > 0 else 'deg-border'}">
-      <div class="kpi-label">Worst Cells Detected</div>
-      <div class="kpi-val mono" style="color:#FF4D4F;">{worst_cnt:,} <span style="font-size:10pt;color:#FAAD14;">({worst_pct:.1f}%)</span></div>
-      <div class="kpi-sub">Critical: {crit_cnt} &bull; Degraded: {deg_cnt}</div>
-    </div>
-    <div class="kpi-card {'ok-border' if avg_cssr >= 98.5 else 'deg-border'}">
-      <div class="kpi-label">System Accessibility (Avg CSSR)</div>
-      <div class="kpi-val mono">{avg_cssr:.2f}%</div>
-      <div class="kpi-sub">Baseline 98.50% (<span class="{cssr_cls}">{cssr_delta:+.2f}%</span>) &bull; Comb HOSR: {avg_hosr:.2f}%{volte_kpi_sub_cssr}</div>
-    </div>
-    <div class="kpi-card {'crit-border' if avg_dcr_ovr > 1.0 else 'ok-border'}">
-      <div class="kpi-label">System Retainability (Overall DCR)</div>
-      <div class="kpi-val mono" style="color:{'#FF4D4F' if avg_dcr_ovr > 1.0 else '#52C41A'};">{avg_dcr_ovr:.2f}%</div>
-      <div class="kpi-sub">eNB DCR: {avg_dcr_enb:.2f}% &bull; Avg CQI: {avg_cqi:.2f}{volte_kpi_sub_dcr}</div>
-    </div>
-  </section>
-
-  <div class="section-title">1. Root Cause Taxonomy Distribution</div>
-  <div class="rca-bar">
-    {rca_pills_html if rca_pills_html else '<span class="rca-pill">No degraded root causes triggered</span>'}
-  </div>
-
-  <div class="section-title">2. Worst Cells &amp; Filtered Telemetry Matrix (Top {min(45, len(report_df))} Cells)</div>
-  <table class="master-table">
-    <thead>
-      <tr>
-        <th style="width:62px;">Status</th>
-        <th style="width:88px;">eNodeB_Name</th>
-        <th style="width:102px;">EUtranCellFDD</th>
-        <th class="num" style="width:44px;">CSSR</th>
-        <th class="num" style="width:46px;">Ovr DCR</th>
-        <th class="num" style="width:46px;">eNB DCR</th>
-        <th class="num" style="width:48px;">Intra HO</th>
-        <th class="num" style="width:48px;">Inter HO</th>
-        <th class="num" style="width:48px;">Comb HO</th>
-        {volte_th_html}
-        <th class="num" style="width:36px;">CQI</th>
-        <th class="num" style="width:46px;">UL dBm</th>
-        <th style="width:96px;">RCA Category</th>
-        <th style="width:94px;">Isolated Phase</th>
-        <th>Primary Root Cause Diagnosis</th>
-        <th class="num" style="width:38px;">Conf.</th>
-      </tr>
-    </thead>
-    <tbody>
-      {"".join(matrix_rows)}
-    </tbody>
-  </table>
-
-  <div class="page-break"></div>
-  <div class="section-title">3. Deep-Dive Cell Diagnostics &amp; Automated AMOS Remediation Scripts</div>
-  {"".join(deep_cards)}
-
-  <div class="footer-note mono">
-    Antigravity Principal RAN Performance &amp; Optimization Suite &bull; 3GPP / Ericsson MOM Deterministic RCA Engine v8.4 (25.Q3)
-  </div>
-
-</body>
-</html>
-"""
-
-
-def _render_via_chromium(html_content: str, browser_bin: str) -> Optional[bytes]:
-    """Compile HTML to PDF via Headless Chromium/Edge (`--headless=new`)."""
-    # Use isolated project runtime folder instead of shared /tmp
-    state_dir = Path(__file__).resolve().parent / ".state" / "pdf_spool"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    token = uuid.uuid4().hex[:12]
-    html_file = state_dir / f"report_{token}.html"
-    pdf_file = state_dir / f"report_{token}.pdf"
-
+def _fmt_num(val: Any, suffix: str = "", digits: int = 2) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)) or pd.isna(val):
+        return "N/A"
     try:
-        html_file.write_text(html_content, encoding="utf-8")
-        file_url = html_file.resolve().as_uri()
-        cmd = [
-            browser_bin,
-            "--headless=new",
-            "--no-sandbox",
-            "--disable-gpu",
-            "--no-pdf-header-footer",
-            "--run-all-compositor-stages-before-draw",
-            "--virtual-time-budget=4000",
-            f"--print-to-pdf={str(pdf_file.resolve())}",
-            file_url,
-        ]
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=35,
-            check=False,
-        )
-        if pdf_file.exists() and pdf_file.stat().st_size > 1000:
-            return pdf_file.read_bytes()
-    except Exception:
-        return None
-    finally:
-        for f in (html_file, pdf_file):
-            try:
-                if f.exists():
-                    f.unlink()
-            except OSError:
-                pass
-    return None
+        return f"{float(val):.{digits}f}{suffix}"
+    except (TypeError, ValueError):
+        return str(val)
 
 
-def _render_via_reportlab(
-    result: AnalysisResult, filtered_df: pd.DataFrame, max_deep_dive: int = 12
-) -> bytes:
-    """Pure-Python ReportLab fallback preserving status badge colors and AMOS blocks."""
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import mm
-    from reportlab.platypus import (
-        PageBreak,
-        Paragraph,
-        Preformatted,
-        SimpleDocTemplate,
-        Spacer,
-        Table,
-        TableStyle,
+def _xml_escape(text: Any) -> str:
+    s = "" if text is None else str(text)
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
     )
 
+
+def _draw_page_chrome(canvas, doc, meta: Dict[str, Any], fonts: Dict[str, str]) -> None:
+    """Renders top telemetry accent bar and bottom page footer on every PDF page."""
+    canvas.saveState()
+    page_w, page_h = landscape(A4)
+
+    # Top thin telemetry bar
+    canvas.setFillColor(CLR_BG_DARK)
+    canvas.rect(0, page_h - 8 * mm, page_w, 8 * mm, stroke=0, fill=1)
+    canvas.setFillColor(colors.HexColor("#38BDF8"))
+    canvas.setFont(fonts["mono_bold"], 7.5)
+    canvas.drawString(
+        12 * mm,
+        page_h - 5.3 * mm,
+        f"ANTIGRAVITY LTE RAN TELEMETRY & RCA ENGINE v9.0  |  DATASET: {meta.get('filename', 'Counters.xlsx')}",
+    )
+    canvas.setFillColor(colors.HexColor("#94A3B8"))
+    canvas.setFont(fonts["mono"], 7.5)
+    canvas.drawRightString(
+        page_w - 12 * mm,
+        page_h - 5.3 * mm,
+        f"MODE: {meta.get('view_mode', 'Aggregated Cell View')}  |  GENERATED: {meta.get('generated_at', '')}",
+    )
+
+    # Bottom footer
+    canvas.setStrokeColor(CLR_BORDER)
+    canvas.setLineWidth(0.5)
+    canvas.line(12 * mm, 10 * mm, page_w - 12 * mm, 10 * mm)
+    canvas.setFillColor(CLR_TEXT_MUTED)
+    canvas.setFont(fonts["sans"], 7.5)
+    canvas.drawString(
+        12 * mm,
+        6 * mm,
+        "Ericsson 3GPP/MOM Standard KPI & Automated AMOS Remediation Report — Rule of Minimum Denominator Enforced",
+    )
+    canvas.setFont(fonts["mono_bold"], 7.5)
+    canvas.drawRightString(page_w - 12 * mm, 6 * mm, f"Page {doc.page}")
+    canvas.restoreState()
+
+
+def generate_diagnostic_pdf(
+    df_display: pd.DataFrame,
+    exec_metrics: Dict[str, Any],
+    meta: Dict[str, Any],
+    amos_lookup: Optional[Dict[str, str]] = None,
+    selected_cell_id: Optional[str] = None,
+    max_table_rows: int = 80,
+    max_playbooks: int = 12,
+) -> bytes:
+    """
+    Builds a complete multi-section A4 Landscape PDF report and returns raw PDF bytes.
+
+    Args:
+        df_display: Filtered / evaluated DataFrame (Aggregated Cell or Hourly ROP level).
+        exec_metrics: Dictionary of Tier-1 Executive KPI summary metrics.
+        meta: Metadata dict (filename, date_range, total_erbs, total_cells, total_rops, view_mode).
+        amos_lookup: Mapping of EUtranCell Id (or row key) -> generated AMOS script string.
+        selected_cell_id: Optional currently inspected cell to prioritize in Deep-Dive section.
+        max_table_rows: Cap on rows rendered in the KPI/RCA matrix table for PDF readability.
+        max_playbooks: Cap on full AMOS terminal playbooks included in Section 3.
+    """
+    fonts = _register_fonts()
     buf = io.BytesIO()
+    meta = dict(meta or {})
+    meta.setdefault("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    page_w, page_h = landscape(A4)
+    margin_lr = 12 * mm
+    usable_w = page_w - 2 * margin_lr
+
     doc = SimpleDocTemplate(
         buf,
         pagesize=landscape(A4),
-        leftMargin=12 * mm,
-        rightMargin=12 * mm,
-        topMargin=12 * mm,
-        bottomMargin=12 * mm,
-        title=f"Ericsson LTE RAN RCA Report - {result.source_name}",
+        leftMargin=margin_lr,
+        rightMargin=margin_lr,
+        topMargin=13 * mm,
+        bottomMargin=14 * mm,
+        title=f"LTE RAN Diagnostic Report - {meta.get('filename', 'Counters.xlsx')}",
+        author="Antigravity Principal RAN Performance Engine",
     )
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "NOC_Title",
-        parent=styles["Heading1"],
-        fontName="Helvetica-Bold",
-        fontSize=15,
-        textColor=colors.HexColor("#F8FAFC"),
-        spaceAfter=2,
-    )
-    sub_style = ParagraphStyle(
-        "NOC_Sub",
+    st_banner_title = ParagraphStyle(
+        "BannerTitle",
         parent=styles["Normal"],
-        fontName="Helvetica",
+        fontName=fonts["sans_bold"],
+        fontSize=15,
+        leading=19,
+        textColor=colors.white,
+    )
+    st_banner_sub = ParagraphStyle(
+        "BannerSub",
+        parent=styles["Normal"],
+        fontName=fonts["mono"],
         fontSize=8.5,
+        leading=12,
         textColor=colors.HexColor("#94A3B8"),
     )
-    sec_style = ParagraphStyle(
-        "SecHeading",
-        parent=styles["Heading2"],
-        fontName="Helvetica-Bold",
-        fontSize=11,
-        textColor=colors.HexColor("#0B0F19"),
-        spaceBefore=10,
-        spaceAfter=6,
-    )
-    cell_txt = ParagraphStyle(
-        "CellTxt",
+    st_sec_hdr = ParagraphStyle(
+        "SectionHdr",
         parent=styles["Normal"],
-        fontName="Helvetica",
+        fontName=fonts["sans_bold"],
+        fontSize=11.5,
+        leading=15,
+        textColor=CLR_BG_DARK,
+        spaceBefore=8,
+        spaceAfter=5,
+    )
+    st_kpi_lbl = ParagraphStyle(
+        "KpiLbl",
+        parent=styles["Normal"],
+        fontName=fonts["sans_bold"],
         fontSize=7.5,
-        leading=9.5,
+        leading=10,
+        textColor=colors.HexColor("#94A3B8"),
     )
-    amos_style = ParagraphStyle(
-        "AmosCode",
-        fontName="Courier",
+    st_kpi_val = ParagraphStyle(
+        "KpiVal",
+        parent=styles["Normal"],
+        fontName=fonts["mono_bold"],
+        fontSize=13,
+        leading=16,
+        textColor=colors.white,
+    )
+    st_kpi_sub = ParagraphStyle(
+        "KpiSub",
+        parent=styles["Normal"],
+        fontName=fonts["mono"],
         fontSize=7,
-        leading=9,
+        leading=9.5,
         textColor=colors.HexColor("#38BDF8"),
-        backColor=colors.HexColor("#0B0F19"),
-        borderPadding=6,
+    )
+    st_th = ParagraphStyle(
+        "TblHeader",
+        parent=styles["Normal"],
+        fontName=fonts["sans_bold"],
+        fontSize=7.2,
+        leading=9.2,
+        textColor=colors.white,
+        alignment=TA_CENTER,
+    )
+    st_td_mono = ParagraphStyle(
+        "TblMono",
+        parent=styles["Normal"],
+        fontName=fonts["mono"],
+        fontSize=6.8,
+        leading=8.8,
+        textColor=CLR_TEXT_MAIN,
+    )
+    st_td_sans = ParagraphStyle(
+        "TblSans",
+        parent=styles["Normal"],
+        fontName=fonts["sans"],
+        fontSize=6.8,
+        leading=8.8,
+        textColor=CLR_TEXT_MAIN,
+    )
+    st_body = ParagraphStyle(
+        "BodySmall",
+        parent=styles["Normal"],
+        fontName=fonts["sans"],
+        fontSize=8.2,
+        leading=11.5,
+        textColor=CLR_TEXT_MAIN,
+    )
+    st_amos = ParagraphStyle(
+        "AmosCode",
+        parent=styles["Code"],
+        fontName=fonts["mono"],
+        fontSize=6.8,
+        leading=8.8,
+        textColor=CLR_TERM_TEXT,
     )
 
-    story = []
+    story: List[Any] = []
 
-    # Header Banner Table
-    hdr_tbl = Table(
-        [
-            [
-                Paragraph("ERICSSON LTE RAN PERFORMANCE & RCA EXECUTIVE REPORT", title_style),
-                Paragraph(
-                    f"<b>Source:</b> {html.escape(result.source_name)}<br/>"
-                    f"<b>Window:</b> {result.data_start_time} to {result.data_end_time}",
-                    sub_style,
-                ),
-            ]
-        ],
-        colWidths=[185 * mm, 88 * mm],
+    # -------------------------------------------------------------------------
+    # HERO TELEMETRY HEADER BANNER
+    # -------------------------------------------------------------------------
+    banner_left = Paragraph(
+        "ERICSSON LTE &amp; VoLTE RAN PERFORMANCE DIAGNOSTIC REPORT<br/>"
+        f"<font size='8.5' color='#38BDF8'>3GPP / Ericsson MOM v9.0 Vectorized KPI, Multi-Domain RCA &amp; Automated AMOS Playbook</font>",
+        st_banner_title,
     )
-    hdr_tbl.setStyle(
+    banner_right = Paragraph(
+        f"<b>Source Workbook:</b> {_xml_escape(meta.get('filename', 'Counters.xlsx'))}<br/>"
+        f"<b>Date Window:</b> {_xml_escape(meta.get('date_range', 'N/A'))}<br/>"
+        f"<b>Network Scope:</b> {meta.get('total_erbs', 0)} ERBS  |  {meta.get('total_cells', 0)} Cells  |  {meta.get('total_rops', 0):,} Cell-Hours",
+        st_banner_sub,
+    )
+    banner_tbl = Table([[banner_left, banner_right]], colWidths=[usable_w * 0.62, usable_w * 0.38])
+    banner_tbl.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0B0F19")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BACKGROUND", (0, 0), (-1, -1), CLR_BG_DARK),
+                ("BOX", (0, 0), (-1, -1), 1.0, CLR_BORDER_DARK),
                 ("LEFTPADDING", (0, 0), (-1, -1), 12),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 12),
                 ("TOPPADDING", (0, 0), (-1, -1), 10),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-                ("LINEBELOW", (0, 0), (-1, -1), 2, colors.HexColor("#38BDF8")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ]
         )
     )
-    story.append(hdr_tbl)
-    story.append(Spacer(1, 5 * mm))
+    story.append(banner_tbl)
+    story.append(Spacer(1, 4 * mm))
 
-    full_df = result.cell_df
-    worst_df = full_df[full_df["Status"].isin(["CRITICAL", "DEGRADED"])]
-    report_df = filtered_df if not filtered_df.empty else worst_df
-    if report_df.empty:
-        report_df = full_df.head(25)
+    # -------------------------------------------------------------------------
+    # SECTION 1: EXECUTIVE METRIC BAR (6 KPI CARDS)
+    # -------------------------------------------------------------------------
+    story.append(Paragraph("1. Executive Network Telemetry Summary", st_sec_hdr))
 
-    story.append(Paragraph("1. Worst Cells Root-Cause Matrix", sec_style))
-    has_volte = bool(getattr(result, "has_volte_counters", False))
+    def _card_cell(title: str, val: str, sub: str, accent_hex: str = "#38BDF8") -> List[Paragraph]:
+        sub_style = ParagraphStyle("CardSubDyn", parent=st_kpi_sub, textColor=colors.HexColor(accent_hex))
+        return [
+            Paragraph(_xml_escape(title), st_kpi_lbl),
+            Spacer(1, 1 * mm),
+            Paragraph(_xml_escape(val), st_kpi_val),
+            Spacer(1, 0.8 * mm),
+            Paragraph(_xml_escape(sub), sub_style),
+        ]
 
-    hdr_cols = [
-        "Status", "eNodeB_Name", "EUtranCellFDD", "CSSR", "Ovr DCR",
-        "Intra HO", "Inter HO", "Comb HO",
+    dcr_val = exec_metrics.get("sys_dcr_pct", 0.0)
+    cssr_val = exec_metrics.get("sys_cssr_pct", 100.0)
+    hosr_val = exec_metrics.get("sys_hosr_pct", 100.0)
+    vdcr_val = exec_metrics.get("sys_volte_dcr_pct", 0.0)
+
+    cards_row = [
+        _card_cell(
+            "EVALUATED SCOPE",
+            f"{exec_metrics.get('total_evaluated', 0):,}",
+            f"Low-Sample Excluded: {exec_metrics.get('stat_insig', 0):,}",
+            "#94A3B8",
+        ),
+        _card_cell(
+            "WORST CELLS / ROPS",
+            f"{exec_metrics.get('worst_count', 0):,}",
+            f"{exec_metrics.get('worst_pct', 0.0):.1f}% Violation Rate",
+            "#FF4D4F" if exec_metrics.get("worst_count", 0) > 0 else "#52C41A",
+        ),
+        _card_cell(
+            "SYSTEM CSSR (%)",
+            f"{cssr_val:.2f}%",
+            f"Delta vs 98.5%: {cssr_val - 98.5:+.2f}%",
+            "#FF4D4F" if cssr_val < 97.0 else ("#FAAD14" if cssr_val < 98.5 else "#52C41A"),
+        ),
+        _card_cell(
+            "SYSTEM OVERALL DCR",
+            f"{dcr_val:.2f}%",
+            "ALERT > 1.0% Baseline" if dcr_val > 1.0 else "Target <= 0.50%",
+            "#FF4D4F" if dcr_val > 1.0 else ("#FAAD14" if dcr_val > 0.5 else "#52C41A"),
+        ),
+        _card_cell(
+            "COMBINED HOSR (%)",
+            f"{hosr_val:.2f}%",
+            "Intra + Inter Mobility",
+            "#FF4D4F" if hosr_val < 95.0 else ("#FAAD14" if hosr_val < 98.0 else "#52C41A"),
+        ),
+        _card_cell(
+            "VoLTE QCI=1 DCR",
+            f"{vdcr_val:.2f}%",
+            f"Avg CQI: {exec_metrics.get('sys_avg_cqi', 0.0):.2f}",
+            "#FF4D4F" if vdcr_val > 0.8 else "#52C41A",
+        ),
     ]
-    if has_volte:
-        hdr_cols.extend(["VoLTE SR", "VoLTE DCR"])
-    hdr_cols.extend(["CQI", "UL dBm", "RCA Category", "Phase", "Primary Root Cause", "Conf"])
-    tbl_data = [hdr_cols]
-    row_styles = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B0F19")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#F8FAFC")),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 6.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
+    col_w = usable_w / 6.0
+    kpi_tbl = Table([cards_row], colWidths=[col_w] * 6)
+    kpi_tbl.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), CLR_CARD_DARK),
+                ("GRID", (0, 0), (-1, -1), 1.5, CLR_BG_DARK),
+                ("BOX", (0, 0), (-1, -1), 1.0, CLR_BORDER_DARK),
+                ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]
+        )
+    )
+    story.append(kpi_tbl)
+    story.append(Spacer(1, 4 * mm))
+
+    # -------------------------------------------------------------------------
+    # SECTION 2: CELL-BY-CELL KPI & ROOT CAUSE MATRIX
+    # -------------------------------------------------------------------------
+    sev_order = {"CRITICAL": 0, "DEGRADED": 1, "NORMAL": 2, "STAT_INSIGNIFICANT": 3}
+    df_sorted = df_display.copy()
+    if "Severity" in df_sorted.columns:
+        df_sorted["_sev_rank"] = df_sorted["Severity"].map(sev_order).fillna(9)
+        sort_cols = ["_sev_rank"]
+        if "DCR_Overall_Pct" in df_sorted.columns:
+            sort_cols.append("DCR_Overall_Pct")
+        df_sorted = df_sorted.sort_values(
+            sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)
+        ).drop(columns=["_sev_rank"])
+
+    df_matrix = df_sorted.head(max_table_rows)
+    story.append(
+        Paragraph(
+            f"2. Cell-by-Cell KPI &amp; Root-Cause Diagnostic Matrix (Showing Top {len(df_matrix)} of {len(df_display):,} Records)",
+            st_sec_hdr,
+        )
+    )
+
+    headers = [
+        "Severity",
+        "ERBS Id",
+        "EUtranCell Id",
+        "EARFCN",
+        "CSSR %",
+        "DCR %",
+        "HOSR %",
+        "VoLTE DCR",
+        "Avg CQI",
+        "UL dBm / PIM",
+        "Primary Metric & Phase",
+        "Isolated Root Cause",
+        "Conf.",
+    ]
+    col_widths = [
+        19 * mm,  # Severity
+        26 * mm,  # ERBS
+        29 * mm,  # Cell
+        13 * mm,  # EARFCN
+        14 * mm,  # CSSR
+        13 * mm,  # DCR
+        14 * mm,  # HOSR
+        15 * mm,  # VoLTE DCR
+        13 * mm,  # CQI
+        23 * mm,  # UL / PIM
+        32 * mm,  # Metric & Phase
+        51 * mm,  # Root Cause
+        11 * mm,  # Conf
+    ]
+    # Scale widths proportionally to exact usable_w
+    scale = usable_w / sum(col_widths)
+    col_widths = [w * scale for w in col_widths]
+
+    table_data: List[List[Any]] = [[Paragraph(_xml_escape(h), st_th) for h in headers]]
+    row_styles: List[tuple] = [
+        ("BACKGROUND", (0, 0), (-1, 0), CLR_BG_DARK),
+        ("GRID", (0, 0), (-1, -1), 0.4, CLR_BORDER),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3.5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3.5),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]
 
-    for idx, (_, r) in enumerate(report_df.head(40).iterrows(), start=1):
-        st_val = str(r["Status"])
-        dcr_o = float(r.get("DCR_Overall", r.get("DCR", 0.0)))
-        intra_str = f"{r['Intra_HOSR']:.1f}%" if float(r.get("Intra_HO_Denom", 0)) > 0 else "—"
-        inter_str = f"{r['Inter_HOSR']:.1f}%" if float(r.get("Inter_HO_Denom", 0)) > 0 else "—"
-        comb_str = f"{r['HOSR']:.1f}%" if float(r.get("HO_Denom", 0)) > 0 else "—"
-        row_vals = [
-            st_val,
-            str(r["eNodeB_Name"]),
-            str(r["EUtranCellFDD"]),
-            f"{r['CSSR']:.2f}%",
-            f"{dcr_o:.2f}%",
-            intra_str,
-            inter_str,
-            comb_str,
-        ]
-        if has_volte:
-            row_vals.extend([
-                f"{float(r.get('VoLTE_CSSR', 100.0)):.2f}%",
-                f"{float(r.get('VoLTE_DCR', 0.0)):.2f}%",
-            ])
-        row_vals.extend([
-            f"{r['Avg_CQI']:.1f}" if pd.notna(r.get("Avg_CQI")) else "N/A",
-            f"{r['UL_Intf_dBm']:.1f}" if pd.notna(r.get("UL_Intf_dBm")) else "N/A",
-            Paragraph(html.escape(str(r["RCA_Category"])), cell_txt),
-            Paragraph(html.escape(str(r.get("Isolated_Phase", "N/A"))), cell_txt),
-            Paragraph(html.escape(str(r["Primary_Root_Cause"])), cell_txt),
-            f"{int(r['Confidence_Score'])}%",
-        ])
-        tbl_data.append(row_vals)
-        if st_val == "CRITICAL":
-            row_styles.append(("BACKGROUND", (0, idx), (0, idx), colors.HexColor("#FEE2E2")))
-            row_styles.append(("TEXTCOLOR", (0, idx), (0, idx), colors.HexColor("#DC2626")))
-        elif st_val == "DEGRADED":
-            row_styles.append(("BACKGROUND", (0, idx), (0, idx), colors.HexColor("#FEF3C7")))
-            row_styles.append(("TEXTCOLOR", (0, idx), (0, idx), colors.HexColor("#D97706")))
-        elif st_val == "NORMAL":
-            row_styles.append(("BACKGROUND", (0, idx), (0, idx), colors.HexColor("#DCFCE7")))
-            row_styles.append(("TEXTCOLOR", (0, idx), (0, idx), colors.HexColor("#15803D")))
+    for idx, (_, r) in enumerate(df_matrix.iterrows(), start=1):
+        sev = str(r.get("Severity", "NORMAL"))
+        fg_clr, bg_clr = _severity_colors(sev)
+        sev_style = ParagraphStyle(
+            f"Sev_{idx}",
+            parent=st_td_mono,
+            fontName=fonts["mono_bold"],
+            textColor=fg_clr,
+            alignment=TA_CENTER,
+        )
+        ul_str = f"{_fmt_num(r.get('UL_Interf_Avg_dBm'), '', 1)} / Δ{_fmt_num(r.get('PRB_Peak_to_Median_dB'), 'dB', 1)}"
+        phase_str = f"{r.get('Primary_Metric', '-')} ({r.get('Isolated_Phase', '-')})"
+        conf_val = r.get("Confidence", "-")
+        conf_str = f"{int(conf_val)}%" if isinstance(conf_val, (int, float)) and pd.notna(conf_val) and conf_val > 0 else "-"
 
-    if has_volte:
-        col_w = [
-            15 * mm, 21 * mm, 24 * mm, 11 * mm, 11 * mm,
-            11 * mm, 11 * mm, 11 * mm, 11 * mm, 11 * mm,
-            9 * mm, 11 * mm, 23 * mm, 22 * mm, 61 * mm, 10 * mm,
+        row_cells = [
+            Paragraph(_xml_escape(sev[:10]), sev_style),
+            Paragraph(_xml_escape(r.get("ERBS Id", "")), st_td_mono),
+            Paragraph(_xml_escape(r.get("EUtranCell Id", "")), st_td_mono),
+            Paragraph(_xml_escape(str(r.get("earfcndl", ""))), st_td_mono),
+            Paragraph(_fmt_num(r.get("CSSR_Pct"), "%"), st_td_mono),
+            Paragraph(_fmt_num(r.get("DCR_Overall_Pct"), "%"), st_td_mono),
+            Paragraph(_fmt_num(r.get("Combined_HOSR_Pct"), "%"), st_td_mono),
+            Paragraph(_fmt_num(r.get("VoLTE_DCR_Rel_Pct"), "%"), st_td_mono),
+            Paragraph(_fmt_num(r.get("Avg_CQI"), ""), st_td_mono),
+            Paragraph(_xml_escape(ul_str), st_td_mono),
+            Paragraph(_xml_escape(phase_str), st_td_sans),
+            Paragraph(_xml_escape(r.get("Root_Cause", "Healthy / Within Baseline")), st_td_sans),
+            Paragraph(_xml_escape(conf_str), st_td_mono),
         ]
-    else:
-        col_w = [
-            16 * mm, 23 * mm, 26 * mm, 12 * mm, 12 * mm,
-            12 * mm, 12 * mm, 12 * mm, 10 * mm, 12 * mm,
-            26 * mm, 24 * mm, 65 * mm, 11 * mm,
-        ]
-    m_tbl = Table(tbl_data, colWidths=col_w, repeatRows=1)
-    m_tbl.setStyle(TableStyle(row_styles))
-    story.append(m_tbl)
+        table_data.append(row_cells)
+        row_bg = colors.white if idx % 2 == 1 else colors.HexColor("#F8FAFC")
+        row_styles.append(("BACKGROUND", (1, idx), (-1, idx), row_bg))
+        row_styles.append(("BACKGROUND", (0, idx), (0, idx), bg_clr))
 
-    story.append(PageBreak())
-    story.append(Paragraph("2. Deep-Dive Diagnostics & AMOS Remediation Scripts", sec_style))
+    matrix_tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+    matrix_tbl.setStyle(TableStyle(row_styles))
+    story.append(matrix_tbl)
 
-    deep_df = report_df[report_df["Status"].isin(["CRITICAL", "DEGRADED"])].head(max_deep_dive)
-    for _, r in deep_df.iterrows():
+    # -------------------------------------------------------------------------
+    # SECTION 3: DEEP-DIVE EVIDENCE & AUTOMATED AMOS REMEDIATION PLAYBOOKS
+    # -------------------------------------------------------------------------
+    degraded_df = df_sorted[df_sorted["Severity"].isin(["CRITICAL", "DEGRADED"])].copy() if "Severity" in df_sorted.columns else pd.DataFrame()
+    if selected_cell_id and not degraded_df.empty and "EUtranCell Id" in degraded_df.columns:
+        sel_rows = degraded_df[degraded_df["EUtranCell Id"] == selected_cell_id]
+        other_rows = degraded_df[degraded_df["EUtranCell Id"] != selected_cell_id]
+        degraded_df = pd.concat([sel_rows, other_rows], ignore_index=True)
+
+    playbook_df = degraded_df.head(max_playbooks)
+    if not playbook_df.empty:
+        story.append(PageBreak())
         story.append(
             Paragraph(
-                f"<b>{html.escape(str(r['EUtranCellFDD']))}</b> ({html.escape(str(r['eNodeB_Name']))}) "
-                f"— [{r['Status']}] {html.escape(str(r['Primary_Root_Cause']))}",
-                 styles["Heading4"],
+                f"3. Deep-Dive Counter Evidence &amp; Automated AMOS / Moshell Playbooks (Top {len(playbook_df)} Worst Cells)",
+                st_sec_hdr,
             )
         )
-        story.append(Preformatted(str(r.get("AMOS_Script", "")), amos_style))
+        story.append(
+            Paragraph(
+                "Operational Safety Protocol: Every playbook includes Pre-Execution Backup (<b>cvms</b>), Online-Safe dynamic tuning commands, and commented Maintenance-Window (<b>bl/deb</b>) commands.",
+                st_body,
+            )
+        )
         story.append(Spacer(1, 3 * mm))
 
-    doc.build(story)
+        for _, r in playbook_df.iterrows():
+            cell_name = str(r.get("EUtranCell Id", "Unknown_Cell"))
+            erbs_name = str(r.get("ERBS Id", "Unknown_eNB"))
+            sev = str(r.get("Severity", "DEGRADED"))
+            fg_clr, bg_clr = _severity_colors(sev)
+
+            hdr_p = Paragraph(
+                f"<b>[{_xml_escape(sev)}] Cell: {_xml_escape(cell_name)}</b>  "
+                f"(eNodeB: {_xml_escape(erbs_name)}  |  EARFCN: {_xml_escape(r.get('earfcndl', ''))}  |  "
+                f"Scenario: {_xml_escape(r.get('Scenario', 'N/A'))}  |  Confidence: {_xml_escape(r.get('Confidence', 90))}%)",
+                ParagraphStyle("CellCardHdr", parent=st_body, fontName=fonts["mono_bold"], textColor=fg_clr),
+            )
+            ev_p = Paragraph(
+                f"<b>Primary Metric / Phase:</b> {_xml_escape(r.get('Primary_Metric', ''))} — {_xml_escape(r.get('Isolated_Phase', ''))}<br/>"
+                f"<b>Isolated Root Cause:</b> {_xml_escape(r.get('Root_Cause', ''))}<br/>"
+                f"<b>Diagnostic Evidence:</b> {_xml_escape(r.get('Diagnostic_Evidence', ''))}",
+                st_body,
+            )
+
+            amos_text = ""
+            if amos_lookup and cell_name in amos_lookup:
+                amos_text = amos_lookup[cell_name]
+            elif "AMOS_Script" in r and pd.notna(r["AMOS_Script"]):
+                amos_text = str(r["AMOS_Script"])
+
+            amos_box = Table([[Preformatted(amos_text.strip(), st_amos)]], colWidths=[usable_w - 6 * mm])
+            amos_box.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, -1), CLR_BG_DARK),
+                        ("BOX", (0, 0), (-1, -1), 0.8, CLR_BORDER_DARK),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                        ("TOPPADDING", (0, 0), (-1, -1), 6),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ]
+                )
+            )
+
+            card_outer = Table(
+                [[hdr_p], [ev_p], [amos_box]],
+                colWidths=[usable_w],
+            )
+            card_outer.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (0, 0), bg_clr),
+                        ("BACKGROUND", (0, 1), (0, 2), colors.white),
+                        ("BOX", (0, 0), (-1, -1), 0.8, fg_clr),
+                        ("LINEBELOW", (0, 0), (0, 0), 0.6, fg_clr),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                        ("TOPPADDING", (0, 0), (-1, -1), 5),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ]
+                )
+            )
+            story.append(KeepTogether([card_outer, Spacer(1, 3.5 * mm)]))
+
+    doc.build(
+        story,
+        onFirstPage=lambda c, d: _draw_page_chrome(c, d, meta, fonts),
+        onLaterPages=lambda c, d: _draw_page_chrome(c, d, meta, fonts),
+    )
     return buf.getvalue()
-
-
-def export_report_to_pdf(
-    result: AnalysisResult,
-    filtered_df: pd.DataFrame,
-    max_deep_dive: int = 12,
-) -> Tuple[bytes, str]:
-    """
-    Generate production-grade PDF report from HTML/CSS template.
-    Uses Headless Chromium/Edge first (per `html-to-pdf` skill), then WeasyPrint,
-    then ReportLab fallback.
-    """
-    html_doc = build_html_report(result, filtered_df, max_deep_dive=max_deep_dive)
-
-    # 1. Headless Chromium / Edge (`--headless=new`)
-    browser_bin = _find_chromium_binary()
-    if browser_bin:
-        pdf_bytes = _render_via_chromium(html_doc, browser_bin)
-        if pdf_bytes:
-            return pdf_bytes, f"Headless Chromium ({Path(browser_bin).name})"
-
-    # 2. WeasyPrint Python Engine (if available)
-    try:
-        import weasyprint  # type: ignore
-
-        pdf_bytes = weasyprint.HTML(string=html_doc).write_pdf()
-        if pdf_bytes:
-            return pdf_bytes, "WeasyPrint"
-    except Exception:
-        pass
-
-    # 3. ReportLab Pure-Python Fallback
-    pdf_bytes = _render_via_reportlab(result, filtered_df, max_deep_dive=max_deep_dive)
-    return pdf_bytes, "ReportLab Platypus"
