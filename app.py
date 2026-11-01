@@ -313,7 +313,7 @@ def inject_cockpit_css() -> None:
             top: 3.75rem !important;
             right: 0 !important;
             bottom: 0 !important;
-            width: min(540px, 94vw) !important;
+            width: min(720px, 94vw) !important;
             z-index: 999990 !important;
             background: linear-gradient(180deg, #111827 0%, #0B0F19 100%) !important;
             border-left: 2px solid var(--cyan-hex) !important;
