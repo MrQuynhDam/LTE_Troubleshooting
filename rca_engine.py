@@ -107,22 +107,55 @@ KPI_BASELINES: Dict[str, Dict[str, float]] = {
 # ==============================================================================
 
 def safe_div(
-    num: Union[pd.Series, np.ndarray, float],
-    den: Union[pd.Series, np.ndarray, float],
+    num: Union[pd.Series, np.ndarray, float, int],
+    den: Union[pd.Series, np.ndarray, float, int],
     scale: float = 1.0,
     fill_na: Optional[float] = np.nan,
-) -> pd.Series:
-    """Vectorized division protecting against ZeroDivisionError and +/-Inf."""
+) -> Union[pd.Series, float]:
+    """Vectorized division protecting against ZeroDivisionError and +/-Inf.
+    Supports both scalar-scalar division (returning float) and vectorized Series/array.
+    """
+    # 1. Xử lý trường hợp cả hai đầu vào đều là số đơn lẻ (scalar từ .sum(), float, int)
+    is_vector = (
+        isinstance(num, (pd.Series, pd.Index))
+        or isinstance(den, (pd.Series, pd.Index))
+        or (isinstance(num, np.ndarray) and num.ndim > 0)
+        or (isinstance(den, np.ndarray) and den.ndim > 0)
+    )
+    if not is_vector:
+        try:
+            n = float(num)
+            d = float(den)
+            if d == 0.0 or np.isnan(d) or np.isnan(n):
+                return fill_na if fill_na is not None else np.nan
+            val = (n / d) * scale
+            if np.isinf(val):
+                return fill_na if fill_na is not None else np.nan
+            return float(val)
+        except (ValueError, TypeError, ZeroDivisionError):
+            return fill_na if fill_na is not None else np.nan
+
+    # 2. Xử lý trường hợp vector hóa (pd.Series / np.ndarray)
     if isinstance(den, pd.Series):
         den_clean = pd.to_numeric(den, errors="coerce").replace(0, np.nan)
+        idx = den.index
+    elif isinstance(num, pd.Series):
+        den_arr = np.asarray(den, dtype=float)
+        den_clean = np.where(den_arr == 0, np.nan, den_arr)
+        idx = num.index
     else:
         den_arr = np.asarray(den, dtype=float)
         den_clean = np.where(den_arr == 0, np.nan, den_arr)
+        idx = getattr(num, "index", None) or getattr(den, "index", None)
+
     res = (num / den_clean) * scale
-    if isinstance(res, pd.Series):
-        res = res.replace([np.inf, -np.inf], np.nan)
-        return res.fillna(fill_na) if fill_na is not None and not np.isnan(fill_na) else res
-    return pd.Series(res)
+    if not isinstance(res, pd.Series):
+        res = pd.Series(res, index=idx)
+
+    res = res.replace([np.inf, -np.inf], np.nan)
+    if fill_na is not None and not np.isnan(fill_na):
+        res = res.fillna(fill_na)
+    return res
 
 
 def get_col(df: pd.DataFrame, col_name: str, default: float = 0.0) -> pd.Series:
